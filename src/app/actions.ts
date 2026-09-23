@@ -92,12 +92,41 @@ export async function startGame(roomId: string) {
   return { ok: true as const };
 }
 
-export async function submitPreference(roomId: string, memberId: string, roleLabel: string) {
+// rank: 1~3지망. roleLabel이 null/빈 문자열이면 그 지망 선택을 지운다(반드시 3개를
+// 다 채울 필요는 없다).
+export async function submitPreference(
+  roomId: string,
+  memberId: string,
+  rank: number,
+  roleLabel: string | null
+) {
   const supabase = getSupabase();
+
+  if (!roleLabel) {
+    const { error } = await supabase
+      .from("role_preferences")
+      .delete()
+      .eq("room_id", roomId)
+      .eq("member_id", memberId)
+      .eq("rank", rank);
+    if (error) return { ok: false as const, error: "선택을 지우지 못했어요" };
+    return { ok: true as const };
+  }
+
+  // 같은 역할을 다른 지망에 이미 골라뒀다면(예: 2지망이었던 역할을 1지망으로 옮기는
+  // 경우) 그 지망을 먼저 비워야 "역할 중복 선택 불가" 유니크 제약에 걸리지 않는다.
+  await supabase
+    .from("role_preferences")
+    .delete()
+    .eq("room_id", roomId)
+    .eq("member_id", memberId)
+    .eq("role_label", roleLabel)
+    .neq("rank", rank);
+
   const { error } = await supabase
     .from("role_preferences")
     .upsert(
-      { room_id: roomId, member_id: memberId, role_label: roleLabel, rank: 1 },
+      { room_id: roomId, member_id: memberId, role_label: roleLabel, rank },
       { onConflict: "room_id,member_id,rank" }
     );
   if (error) return { ok: false as const, error: "선택을 저장하지 못했어요" };
@@ -127,6 +156,15 @@ function shuffle<T>(items: T[]): T[] {
   return arr;
 }
 
+// 지망 순서대로(1지망 -> 2지망 -> 3지망) 라운드를 돌면서 배정한다. 각 라운드에서
+// 같은 역할에 여러 명이 몰리면(충돌) 그 사람들 사이에서만 가중치 뽑기로 승자를 정하고,
+// 진 사람은 다음 라운드에서 자기 다음 지망으로 다시 시도할 기회를 갖는다 — "1지망이
+// 겹치면 바로 랜덤" 대신 지망을 다 써볼 수 있게 하는 부분이 이 함수의 핵심이다.
+// 지망을 하나도 못 받은 사람/아무도 원하지 않은 역할은 마지막에 무작위로 짝지어진다
+// (resolved_by='draw', assigned_rank=null = "비선호 역할 배정").
+//
+// 지금은 충돌을 뽑기로만 푸는데, resolved_by 필드를 남겨둔 건 나중에 우선권/카드/협상
+// 같은 다른 해결 방식을 추가할 자리를 만들어두기 위해서다.
 export async function resolveRoles(roomId: string) {
   const supabase = getSupabase();
 
@@ -145,53 +183,69 @@ export async function resolveRoles(roomId: string) {
     return { ok: false as const, error: "참가자가 2명 이상 필요해요" };
   }
 
-  const { data: prefs } = await supabase
-    .from("role_preferences")
-    .select("*")
-    .eq("room_id", roomId)
-    .eq("rank", 1);
+  const { data: prefs } = await supabase.from("role_preferences").select("*").eq("room_id", roomId);
 
-  const byRole = new Map<string, Member[]>(roleList.map((role) => [role, []]));
+  // member_id -> rank -> role_label
+  const prefsByMember = new Map<string, Map<number, string>>();
   for (const p of prefs ?? []) {
-    const member = members.find((m) => m.id === p.member_id);
-    const candidates = member && byRole.get(p.role_label);
-    if (member && candidates) candidates.push(member);
+    if (!prefsByMember.has(p.member_id)) prefsByMember.set(p.member_id, new Map());
+    prefsByMember.get(p.member_id)!.set(p.rank, p.role_label);
   }
 
   const round = room.round + 1;
-  const results = new Map<string, { member: Member; resolvedBy: "preference" | "draw" }>();
-  const leftoverRoles: string[] = [];
+  const results = new Map<
+    string,
+    { role: string; assignedRank: number | null; resolvedBy: "preference" | "draw" }
+  >();
+  let unassigned = members;
+  const remainingRoles = new Set(roleList);
 
-  for (const [role, candidates] of byRole) {
-    if (candidates.length === 0) {
-      leftoverRoles.push(role);
-    } else if (candidates.length === 1) {
-      results.set(role, { member: candidates[0], resolvedBy: "preference" });
-    } else {
-      // 충돌 — 지원자들 사이에서만 가중치 뽑기로 결정한다. 진 사람은 아래에서
-      // 남은 역할에 다시 배정될 기회를 갖는다.
-      results.set(role, { member: weightedPick(candidates, round), resolvedBy: "draw" });
+  const maxRank = Math.min(3, roleList.length);
+  for (let rank = 1; rank <= maxRank; rank++) {
+    if (unassigned.length === 0 || remainingRoles.size === 0) break;
+
+    const byRole = new Map<string, Member[]>();
+    for (const member of unassigned) {
+      const role = prefsByMember.get(member.id)?.get(rank);
+      if (role && remainingRoles.has(role)) {
+        if (!byRole.has(role)) byRole.set(role, []);
+        byRole.get(role)!.push(member);
+      }
     }
+
+    for (const [role, candidates] of byRole) {
+      const winner = candidates.length === 1 ? candidates[0] : weightedPick(candidates, round);
+      results.set(winner.id, {
+        role,
+        assignedRank: rank,
+        resolvedBy: candidates.length > 1 ? "draw" : "preference",
+      });
+      remainingRoles.delete(role);
+    }
+    unassigned = unassigned.filter((m) => !results.has(m.id));
   }
 
-  const assignedMemberIds = new Set([...results.values()].map((r) => r.member.id));
-  const leftoverMembers = shuffle(members.filter((m) => !assignedMemberIds.has(m.id)));
-  // 지원자가 없던 역할은 아직 역할이 없는 사람들에게 무작위로 채운다(사람이 역할보다
-  // 적으면 일부 역할은 이번 라운드엔 못 채운다).
-  for (const role of leftoverRoles) {
+  // 지망을 다 써도 못 받았거나 애초에 아무것도 고르지 않은 사람 <-> 아무도 원하지 않은
+  // 역할을 마지막으로 무작위 매칭한다.
+  const leftoverMembers = shuffle(unassigned);
+  for (const role of remainingRoles) {
     const person = leftoverMembers.shift();
     if (!person) break;
-    results.set(role, { member: person, resolvedBy: "draw" });
+    results.set(person.id, { role, assignedRank: null, resolvedBy: "draw" });
   }
 
-  const rows = [...results.entries()].map(([role_label, { member, resolvedBy }]) => ({
-    room_id: roomId,
-    role_label,
-    member_id: member.id,
-    member_name: member.name,
-    resolved_by: resolvedBy,
-    round,
-  }));
+  const rows = [...results.entries()].map(([memberId, { role, assignedRank, resolvedBy }]) => {
+    const member = members.find((m) => m.id === memberId)!;
+    return {
+      room_id: roomId,
+      role_label: role,
+      member_id: member.id,
+      member_name: member.name,
+      assigned_rank: assignedRank,
+      resolved_by: resolvedBy,
+      round,
+    };
+  });
 
   const { error: insertError } = await supabase.from("role_assignments").insert(rows);
   if (insertError) return { ok: false as const, error: "결과를 저장하지 못했어요" };

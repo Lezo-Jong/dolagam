@@ -55,6 +55,8 @@ export interface RoleAssignment {
   role_label: string;
   member_id: string | null;
   member_name: string;
+  // 몇 지망이 반영됐는지 — 비선호 역할로 배정되면 null.
+  assigned_rank: number | null;
   resolved_by: "preference" | "draw";
   round: number;
   created_at: string;

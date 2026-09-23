@@ -45,9 +45,10 @@ create table draws (
   created_at  timestamptz not null default now()
 );
 
--- 역할 게임: 각자 1지망(rank=1 고정 — 나중에 2/3지망으로 확장할 수 있게 rank 컬럼만
--- 미리 열어둔다)을 저장한다. situations.ts 프리셋의 role 문자열을 그대로 role_label에
--- 저장한다(역할은 아직 방장이 편집하는 개념이 아니라 별도 roles 테이블로 정규화하지 않음).
+-- 역할 게임: 각자 1~3지망을 저장한다(rank 1=1지망 ... 3=3지망). situations.ts 프리셋의
+-- role 문자열을 그대로 role_label에 저장한다(역할은 아직 방장이 편집하는 개념이 아니라
+-- 별도 roles 테이블로 정규화하지 않음). 같은 역할을 두 지망에 중복 선택할 수 없도록
+-- (room_id, member_id, role_label)도 유니크로 막는다.
 create table role_preferences (
   id         uuid primary key default gen_random_uuid(),
   room_id    uuid not null references rooms(id) on delete cascade,
@@ -55,20 +56,23 @@ create table role_preferences (
   role_label text not null,
   rank       int not null default 1,
   created_at timestamptz not null default now(),
-  unique (room_id, member_id, rank)
+  unique (room_id, member_id, rank),
+  unique (room_id, member_id, role_label)
 );
 
--- 역할 게임 최종 결과. resolved_by로 "선택 그대로 배정됐는지" vs "충돌해서 뽑기로
--- 정해졌는지"를 구분해 화면에 표시한다 — 결과가 전부 랜덤이 아니라는 걸 보여주는 지점.
+-- 역할 게임 최종 결과. assigned_rank로 "몇 지망이 반영됐는지"(비선호로 배정됐으면 null)를,
+-- resolved_by로 "충돌 없이 그대로 배정됐는지 / 충돌해서 뽑기로 정해졌는지"를 구분해
+-- 화면에 표시한다 — 결과가 전부 랜덤이 아니라는 걸 보여주는 지점.
 create table role_assignments (
-  id          uuid primary key default gen_random_uuid(),
-  room_id     uuid not null references rooms(id) on delete cascade,
-  role_label  text not null,
-  member_id   uuid references members(id) on delete set null,
-  member_name text not null,
-  resolved_by text not null default 'preference',
-  round       int not null,
-  created_at  timestamptz not null default now()
+  id            uuid primary key default gen_random_uuid(),
+  room_id       uuid not null references rooms(id) on delete cascade,
+  role_label    text not null,
+  member_id     uuid references members(id) on delete set null,
+  member_name   text not null,
+  assigned_rank int,
+  resolved_by   text not null default 'preference',
+  round         int not null,
+  created_at    timestamptz not null default now()
 );
 
 create index members_room_id_idx on members(room_id);
@@ -189,3 +193,11 @@ create policy role_preferences_open on role_preferences for all using (true) wit
 create policy role_assignments_open on role_assignments for all using (true) with check (true);
 alter publication supabase_realtime add table public.role_preferences;
 alter publication supabase_realtime add table public.role_assignments;
+
+-- ============================================================
+-- 마이그레이션 2: 1인 1지망 -> 1~3지망으로 확장하면서 추가된 부분.
+-- role_preferences/role_assignments를 이미 위 마이그레이션 1로 만들어 둔 프로젝트는
+-- 이 블록만 SQL Editor에서 실행한다.
+-- ============================================================
+alter table role_preferences add constraint role_preferences_room_member_role_key unique (room_id, member_id, role_label);
+alter table role_assignments add column if not exists assigned_rank int;
