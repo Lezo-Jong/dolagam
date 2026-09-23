@@ -54,6 +54,7 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
         initialConflictChoices={(conflictChoices ?? []) as RoleConflictChoice[]}
         roles={situationInfo.situation.roles}
         situationLabel={`${situationInfo.category.label} · ${situationInfo.situation.label}`}
+        recurring={situationInfo.situation.recurring}
       />
     );
   }

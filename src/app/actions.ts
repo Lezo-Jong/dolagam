@@ -156,6 +156,35 @@ function shuffle<T>(items: T[]): T[] {
   return arr;
 }
 
+// 무작위로 섞어서 짝짓되, 직전 라운드에 그 역할을 맡았던 사람과 겹치면 겹치지 않는
+// 다른 자리와 맞바꿔본다. 완벽한 알고리즘은 아니고(맞바꿀 상대가 없으면 그냥 둔다),
+// "직전에 하던 걸 그대로 또 하는 것"만 최대한 피하는 수준이다.
+function assignLeftoversAvoidingRepeat(
+  members: Member[],
+  roles: string[],
+  previousRoleByMember: Map<string, string>
+): { member: Member; role: string }[] {
+  const shuffledMembers = shuffle(members);
+  const count = Math.min(shuffledMembers.length, roles.length);
+  const pairs = shuffledMembers.slice(0, count).map((member, i) => ({ member, role: roles[i] }));
+
+  for (let i = 0; i < pairs.length; i++) {
+    if (previousRoleByMember.get(pairs[i].member.id) !== pairs[i].role) continue;
+    const swapWith = pairs.findIndex(
+      (p, j) =>
+        j !== i &&
+        previousRoleByMember.get(p.member.id) !== pairs[i].role &&
+        previousRoleByMember.get(pairs[i].member.id) !== p.role
+    );
+    if (swapWith !== -1) {
+      const tmp = pairs[i].role;
+      pairs[i].role = pairs[swapWith].role;
+      pairs[swapWith].role = tmp;
+    }
+  }
+  return pairs;
+}
+
 // 지망 순서대로(1지망 -> 2지망 -> 3지망) 라운드를 돌면서 배정한다. 각 지망 단계에서
 // 역할 하나에 후보가 1명뿐이면 바로 배정하고, 2명 이상 몰리면(충돌) 즉시 뽑지 않고
 // role_conflicts 행을 만들어 "우선권/양보/승부" 선택을 기다린다 — 뽑기는 게임 전체가
@@ -219,22 +248,32 @@ async function processNextRankInner(
 
   if (unassigned.length === 0 || remainingRoles.length === 0 || nextRank > maxRank) {
     // 지망을 다 써도 못 받았거나 아무도 원하지 않은 역할 <-> 사람을 무작위로 짝짓고 마무리한다.
-    const leftoverMembers = shuffle(unassigned);
-    const rows = remainingRoles.flatMap((role) => {
-      const person = leftoverMembers.shift();
-      if (!person) return [];
-      return [
-        {
-          room_id: roomId,
-          role_label: role,
-          member_id: person.id,
-          member_name: person.name,
-          assigned_rank: null,
-          resolved_by: "draw" as const,
-          round: workingRound,
-        },
-      ];
-    });
+    // 완벽한 공정성 알고리즘까진 아니지만, 가능하면 직전 라운드에 맡았던 역할을 그대로
+    // 다시 받는 것 정도는 피한다(반복 당번에서 특히 중요한 부분).
+    let previousRoleByMember = new Map<string, string>();
+    if (room.round > 0) {
+      const { data: prevAssignments } = await supabase
+        .from("role_assignments")
+        .select("member_id, role_label")
+        .eq("room_id", roomId)
+        .eq("round", room.round);
+      previousRoleByMember = new Map(
+        (prevAssignments ?? [])
+          .filter((a): a is { member_id: string; role_label: string } => a.member_id !== null)
+          .map((a) => [a.member_id, a.role_label])
+      );
+    }
+
+    const pairs = assignLeftoversAvoidingRepeat(unassigned, remainingRoles, previousRoleByMember);
+    const rows = pairs.map(({ member, role }) => ({
+      room_id: roomId,
+      role_label: role,
+      member_id: member.id,
+      member_name: member.name,
+      assigned_rank: null,
+      resolved_by: "draw" as const,
+      round: workingRound,
+    }));
     if (rows.length > 0) await supabase.from("role_assignments").insert(rows);
 
     const drawnIds = rows.map((r) => r.member_id);
@@ -547,10 +586,14 @@ export async function submitRpsMove(conflictId: string, memberId: string, move: 
   return { ok: true as const };
 }
 
+// "다시 하기" / "다음 주 당번 정하기" — 같은 방·참가자로 새 게임 세션을 시작한다.
+// role_assignments는 지우지 않고 그대로 둔다 — round 번호로 이미 구분되니 다음 라운드
+// 계산에 영향을 주지 않고, 다음 finalize 단계의 "직전 역할 회피"가 이걸 참고한다.
+// role_preferences는 round 구분이 없는 "이번 라운드 진행 중" 데이터라 반드시 비워야
+// 다음 라운드에 예전 선택이 섞여 들어가지 않는다.
 export async function restartRound(roomId: string) {
   const supabase = getSupabase();
   await supabase.from("role_conflicts").delete().eq("room_id", roomId);
-  await supabase.from("role_assignments").delete().eq("room_id", roomId);
   await supabase.from("role_preferences").delete().eq("room_id", roomId);
   await supabase.from("members").update({ priority_token_used: false }).eq("room_id", roomId);
   await supabase.from("rooms").update({ game_phase: "preference", conflict_rank: 0 }).eq("id", roomId);

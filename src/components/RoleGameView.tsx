@@ -6,6 +6,7 @@
 // 이 채널로 돌아오므로 성공 시 로컬 state를 직접 조작할 필요가 없다.
 import { useEffect, useState, useSyncExternalStore, useTransition } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   addMember,
   removeMember,
@@ -16,7 +17,7 @@ import {
   submitPreference,
   submitRpsMove,
 } from "@/app/actions";
-import { getMyMemberId, setMyMemberId } from "@/lib/identity";
+import { clearMyMemberId, getMyMemberId, setMyMemberId } from "@/lib/identity";
 import { getSupabase } from "@/lib/supabase";
 import type {
   ConflictChoice,
@@ -38,6 +39,7 @@ export function RoleGameView({
   initialConflictChoices,
   roles,
   situationLabel,
+  recurring,
 }: {
   initialRoom: Room;
   initialMembers: Member[];
@@ -47,7 +49,9 @@ export function RoleGameView({
   initialConflictChoices: RoleConflictChoice[];
   roles: string[];
   situationLabel: string;
+  recurring: boolean;
 }) {
+  const router = useRouter();
   const [supabase] = useState(() => getSupabase());
   const [room, setRoom] = useState(initialRoom);
   const [members, setMembers] = useState(initialMembers);
@@ -83,6 +87,12 @@ export function RoleGameView({
   const [resolveError, setResolveError] = useState<string | null>(null);
 
   const [restarting, startRestarting] = useTransition();
+
+  // "방으로 돌아가기"는 방 상태를 바꾸지 않는, 이 브라우저만의 화면 전환이다(다른 사람은
+  // 여전히 결과를 볼 수 있어야 하니까). 어떤 라운드를 넘겼는지만 기억해두면, 다음
+  // 라운드 결과가 나왔을 때 자동으로 다시 보이게 할 수 있다(round가 바뀌면 조건이 깨짐).
+  const [dismissedRound, setDismissedRound] = useState<number | null>(null);
+  const viewingResult = dismissedRound !== room.round;
 
   useEffect(() => {
     const channel = supabase
@@ -256,9 +266,18 @@ export function RoleGameView({
   }
 
   function handleRestart() {
+    setDismissedRound(null);
     startRestarting(async () => {
       await restartRound(room.id);
     });
+  }
+
+  function handleLeave() {
+    if (myMemberId) {
+      removeMember(myMemberId);
+      clearMyMemberId(room.id);
+    }
+    router.push("/");
   }
 
   const maxRank = Math.min(3, roles.length);
@@ -328,7 +347,8 @@ export function RoleGameView({
         <h2 className="text-sm font-semibold text-zinc-500">참가자 {members.length}명</h2>
         {members.length > 1 && (
           <p className="text-xs text-zinc-400">
-            이름을 탭하면 그 사람이 돼서 지망을 고를 수 있어요 — 혼자 시연할 때 유용해요.
+            이름을 탭하면 그 사람이 돼요 — 지망 선택, 충돌 대응까지 그 사람 대신 할 수
+            있어요. 혼자 시연할 때 유용해요.
           </p>
         )}
         <ul className="flex flex-wrap gap-2">
@@ -478,34 +498,58 @@ export function RoleGameView({
 
       {room.game_phase === "result" && (
         <section className="flex flex-col gap-3">
-          <h2 className="text-sm font-semibold text-zinc-500">결과</h2>
-          <ul className="flex flex-col gap-2">
-            {assignments
-              .filter((a) => a.round === room.round)
-              .map((a) => (
-                <li
-                  key={a.id}
-                  className="flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
-                >
-                  <div>
-                    <span className="font-medium text-zinc-900 dark:text-zinc-50">
-                      {a.member_name} → {a.role_label}
-                    </span>
-                    {resolutionTag(a.resolved_by) && (
-                      <p className="text-xs text-zinc-400">{resolutionTag(a.resolved_by)}</p>
-                    )}
-                  </div>
-                  <span className="text-xs text-zinc-400">{rankBadge(a.assigned_rank)}</span>
-                </li>
-              ))}
-          </ul>
-          <button
-            onClick={handleRestart}
-            disabled={restarting}
-            className="mt-2 h-11 w-full rounded-xl border border-zinc-300 text-sm font-semibold text-zinc-700 transition-colors hover:border-zinc-900 disabled:opacity-60 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-zinc-50"
-          >
-            다시 정하기
-          </button>
+          {viewingResult ? (
+            <>
+              <div className="text-center">
+                <h2 className="text-xl font-bold text-zinc-900 dark:text-zinc-50">
+                  {recurring ? "🎉 이번 주 당번 완료!" : "🎉 역할 배정 완료!"}
+                </h2>
+                <p className="text-sm text-zinc-500">이번 게임의 최종 결과예요.</p>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                {assignments
+                  .filter((a) => a.round === room.round)
+                  .map((a) => (
+                    <div
+                      key={a.id}
+                      className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
+                    >
+                      <p className="text-sm text-zinc-400">👤 {a.member_name}</p>
+                      <p className="mt-1 text-lg font-bold text-zinc-900 dark:text-zinc-50">{a.role_label}</p>
+                      <div className="mt-1 flex items-center gap-2 text-sm text-zinc-500">
+                        <span>{rankBadge(a.assigned_rank)}</span>
+                        {resolutionTag(a.resolved_by) && <span>· {resolutionTag(a.resolved_by)}</span>}
+                      </div>
+                    </div>
+                  ))}
+              </div>
+            </>
+          ) : (
+            <p className="text-center text-sm text-zinc-500">방 대기 화면이에요.</p>
+          )}
+
+          <div className="flex flex-col gap-2">
+            <button
+              onClick={handleRestart}
+              disabled={restarting}
+              className="h-12 w-full rounded-xl bg-zinc-900 text-base font-bold text-white transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-300"
+            >
+              {restarting ? "준비하는 중..." : recurring ? "🔄 다음 주 당번 정하기" : "🔄 다시 하기"}
+            </button>
+            <button
+              onClick={() => setDismissedRound(viewingResult ? room.round : null)}
+              className="h-11 w-full rounded-xl border border-zinc-300 text-sm font-semibold text-zinc-700 transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-zinc-50"
+            >
+              {viewingResult ? "🏠 방으로 돌아가기" : "결과 다시 보기"}
+            </button>
+            <button
+              onClick={handleLeave}
+              className="h-11 w-full rounded-xl text-sm font-medium text-zinc-400 transition-colors hover:text-red-500"
+            >
+              🚪 나가기
+            </button>
+          </div>
         </section>
       )}
     </div>
@@ -550,6 +594,12 @@ function ConflictCard({
   const myChoice = choices.find((c) => c.conflict_id === conflict.id && c.member_id === myMemberId);
   const iAmCandidate = myMemberId != null && conflict.candidate_ids.includes(myMemberId);
 
+  const pendingNames = conflict.candidate_ids
+    .filter((id) => !choices.find((c) => c.conflict_id === conflict.id && c.member_id === id)?.choice)
+    .map((id) => members.find((m) => m.id === id)?.name)
+    .filter(Boolean)
+    .join(", ");
+
   return (
     <div className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
       <p className="font-semibold text-zinc-900 dark:text-zinc-50">
@@ -558,7 +608,9 @@ function ConflictCard({
 
       {conflict.status === "choosing" &&
         (!iAmCandidate ? (
-          <p className="mt-2 text-sm text-zinc-500">결정 중이에요...</p>
+          <p className="mt-2 text-sm text-zinc-500">
+            {pendingNames}님의 선택을 기다리는 중... (이름을 탭해서 대신 선택할 수 있어요)
+          </p>
         ) : myChoice?.choice ? (
           <p className="mt-2 text-sm text-zinc-500">선택 완료! 상대를 기다리는 중...</p>
         ) : (
@@ -589,7 +641,13 @@ function ConflictCard({
         ))}
 
       {conflict.status === "rps" && (
-        <RpsSection conflict={conflict} choices={choices} myMemberId={myMemberId} onRpsMove={onRpsMove} />
+        <RpsSection
+          conflict={conflict}
+          members={members}
+          choices={choices}
+          myMemberId={myMemberId}
+          onRpsMove={onRpsMove}
+        />
       )}
     </div>
   );
@@ -597,11 +655,13 @@ function ConflictCard({
 
 function RpsSection({
   conflict,
+  members,
   choices,
   myMemberId,
   onRpsMove,
 }: {
   conflict: RoleConflict;
+  members: Member[];
   choices: RoleConflictChoice[];
   myMemberId: string | null;
   onRpsMove: (conflictId: string, move: RpsMove) => void;
@@ -609,12 +669,18 @@ function RpsSection({
   const finalistIds = conflict.finalist_ids ?? [];
   const iAmFinalist = myMemberId != null && finalistIds.includes(myMemberId);
   const myMove = choices.find((c) => c.conflict_id === conflict.id && c.member_id === myMemberId)?.rps_move;
+  const finalistNames = finalistIds
+    .map((id) => members.find((m) => m.id === id)?.name)
+    .filter(Boolean)
+    .join(" vs ");
 
   return (
     <div className="mt-2">
       <p className="text-sm text-zinc-500">선택이 겹쳤어요 — 가위바위보로 정해요!</p>
       {!iAmFinalist ? (
-        <p className="mt-2 text-sm text-zinc-500">대결 중이에요...</p>
+        <p className="mt-2 text-sm text-zinc-500">
+          {finalistNames} 대결 중... (이름을 탭해서 대신 낼 수 있어요)
+        </p>
       ) : myMove ? (
         <p className="mt-2 text-sm text-zinc-500">냈어요! 상대를 기다리는 중...</p>
       ) : (

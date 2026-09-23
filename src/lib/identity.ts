@@ -19,3 +19,12 @@ export function setMyMemberId(roomId: string, memberId: string) {
     // 저장 실패해도 치명적이지 않다 — 다음에 다시 이름을 입력하면 된다.
   }
 }
+
+// "나가기" — 이 브라우저가 기억하던 정체성을 지운다. 다시 들어오면 이름을 새로 입력해야 한다.
+export function clearMyMemberId(roomId: string) {
+  try {
+    localStorage.removeItem(key(roomId));
+  } catch {
+    // 무시해도 된다 — 어차피 페이지를 벗어난다.
+  }
+}
