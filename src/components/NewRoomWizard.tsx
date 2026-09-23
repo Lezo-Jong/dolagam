@@ -1,11 +1,15 @@
 "use client";
-// 홈 화면 위저드: 문제 유형 선택 → 상황 선택 → (기존) 방 만들기.
+// 홈 화면 위저드: 문제 유형 선택 → 상황 선택 → 방 만들기.
 // 세 단계 모두 이 컴포넌트 안의 로컬 state로만 관리한다(새 라우트/서버 상태 없음) —
-// 방이 실제로 생기는 시점은 마지막 단계에서 기존 CreateRoomForm이 createRoom 액션을
-// 호출할 때뿐이라, 앞 두 단계는 그냥 "어떤 값을 hidden input으로 들려 보낼지" 고르는
-// 과정에 지나지 않는다.
-import { useState } from "react";
-import { CreateRoomForm } from "@/components/CreateRoomForm";
+// 방이 실제로 생기는 시점은 마지막 단계에서 createRoom 액션을 호출할 때뿐이라, 앞 두
+// 단계는 그냥 "어떤 값을 hidden input으로 들려 보낼지" 고르는 과정에 지나지 않는다.
+//
+// 마지막 단계는 상황을 고르면 정해지는 역할 풀(situations.ts)을 그대로 보여주고
+// 확인만 받는다 — 자유 텍스트로 "무슨 일을 정할까요?"를 다시 묻지 않는다. 그 질문은
+// 역할이 여러 개로 나뉘는 이 흐름과 맞지 않기 때문이다(CreateRoomForm은 자유 텍스트
+// task가 필요할 미래의 다른 문제 유형을 위해 그대로 남겨둔다).
+import { useActionState, useState } from "react";
+import { createRoom } from "@/app/actions";
 import { PROBLEM_TYPES, type ProblemTypeId } from "@/lib/problemTypes";
 import { SITUATION_CATEGORIES } from "@/lib/situations";
 
@@ -16,7 +20,8 @@ export function NewRoomWizard() {
   const [problemType, setProblemType] = useState<ProblemTypeId | null>(null);
   const [situationId, setSituationId] = useState<string | null>(null);
   const [situationLabel, setSituationLabel] = useState<string | null>(null);
-  const [taskHint, setTaskHint] = useState<string | undefined>(undefined);
+  const [situationName, setSituationName] = useState<string>("");
+  const [situationRoles, setSituationRoles] = useState<string[]>([]);
 
   if (step === "problem") {
     return (
@@ -90,7 +95,8 @@ export function NewRoomWizard() {
                     onClick={() => {
                       setSituationId(s.id);
                       setSituationLabel(`${category.label} · ${s.label}`);
-                      setTaskHint(s.taskHint);
+                      setSituationName(s.label);
+                      setSituationRoles(s.roles);
                       setStep("create");
                     }}
                     className="rounded-full border border-zinc-300 bg-white px-3.5 py-1.5 text-sm text-zinc-700 transition-colors hover:border-zinc-900 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-zinc-50 dark:hover:text-zinc-50"
@@ -120,24 +126,66 @@ export function NewRoomWizard() {
           <h1 className="text-3xl font-bold tracking-tight text-zinc-900 dark:text-zinc-50">
             돌아가면요
           </h1>
-          <p className="text-base text-zinc-600 dark:text-zinc-400">누가 할지, 공평하게 뽑아요.</p>
+          <p className="text-base text-zinc-600 dark:text-zinc-400">이 역할들을 나눠 맡아요.</p>
           {situationLabel && <p className="text-sm text-zinc-400">{situationLabel}</p>}
         </div>
       </div>
 
       <div className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
-        <CreateRoomForm
-          problemType={problemType ?? undefined}
-          situation={situationId}
-          taskPlaceholder={taskHint}
-        />
+        <div className="flex flex-wrap gap-2">
+          {situationRoles.map((role) => (
+            <span
+              key={role}
+              className="rounded-full bg-zinc-100 px-3 py-1.5 text-sm text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+            >
+              {role}
+            </span>
+          ))}
+        </div>
+        <div className="mt-4">
+          <ConfirmCreateRoomForm
+            problemType={problemType ?? "role_assignment"}
+            situation={situationId ?? ""}
+            task={situationName}
+          />
+        </div>
       </div>
 
       <p className="text-center text-sm leading-6 text-zinc-500 dark:text-zinc-500">
         로그인 없이 링크로 바로 참여해요.
         <br />
-        오래 안 뽑힐수록 다음에 뽑힐 확률이 올라가요.
+        같은 역할에 몰리면 그 사람들끼리만 공정하게 뽑아요.
       </p>
     </>
+  );
+}
+
+function ConfirmCreateRoomForm({
+  problemType,
+  situation,
+  task,
+}: {
+  problemType: string;
+  situation: string;
+  task: string;
+}) {
+  const [, formAction, pending] = useActionState(async (_prev: null, formData: FormData) => {
+    await createRoom(formData);
+    return null;
+  }, null);
+
+  return (
+    <form action={formAction}>
+      <input type="hidden" name="problem_type" value={problemType} />
+      <input type="hidden" name="situation" value={situation} />
+      <input type="hidden" name="task" value={task} />
+      <button
+        type="submit"
+        disabled={pending}
+        className="w-full rounded-xl bg-zinc-900 px-4 py-3 text-base font-semibold text-white transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-300"
+      >
+        {pending ? "만드는 중..." : "방 만들기"}
+      </button>
+    </form>
   );
 }

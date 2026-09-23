@@ -18,7 +18,11 @@ create table rooms (
   problem_type text not null default 'role_assignment',
   -- 방을 만들 때 고른 상황(src/lib/situations.ts의 situation id). 참고용 정보라 선택
   -- 안 해도 그만이라 null 허용.
-  situation    text
+  situation    text,
+  -- 게임 진행 단계: lobby(참가자 모으기) -> preference(1지망 선택) -> result(역할 확정).
+  -- situation이 situations.ts의 프리셋과 매칭되지 않는 예전 방(단순 task 한 줄짜리)은
+  -- 이 값과 무관하게 예전 화면(RoomView)을 그대로 보여준다 — 하위 호환.
+  game_phase   text not null default 'lobby'
 );
 
 create table members (
@@ -41,21 +45,55 @@ create table draws (
   created_at  timestamptz not null default now()
 );
 
+-- 역할 게임: 각자 1지망(rank=1 고정 — 나중에 2/3지망으로 확장할 수 있게 rank 컬럼만
+-- 미리 열어둔다)을 저장한다. situations.ts 프리셋의 role 문자열을 그대로 role_label에
+-- 저장한다(역할은 아직 방장이 편집하는 개념이 아니라 별도 roles 테이블로 정규화하지 않음).
+create table role_preferences (
+  id         uuid primary key default gen_random_uuid(),
+  room_id    uuid not null references rooms(id) on delete cascade,
+  member_id  uuid not null references members(id) on delete cascade,
+  role_label text not null,
+  rank       int not null default 1,
+  created_at timestamptz not null default now(),
+  unique (room_id, member_id, rank)
+);
+
+-- 역할 게임 최종 결과. resolved_by로 "선택 그대로 배정됐는지" vs "충돌해서 뽑기로
+-- 정해졌는지"를 구분해 화면에 표시한다 — 결과가 전부 랜덤이 아니라는 걸 보여주는 지점.
+create table role_assignments (
+  id          uuid primary key default gen_random_uuid(),
+  room_id     uuid not null references rooms(id) on delete cascade,
+  role_label  text not null,
+  member_id   uuid references members(id) on delete set null,
+  member_name text not null,
+  resolved_by text not null default 'preference',
+  round       int not null,
+  created_at  timestamptz not null default now()
+);
+
 create index members_room_id_idx on members(room_id);
 create index draws_room_id_idx on draws(room_id);
+create index role_preferences_room_id_idx on role_preferences(room_id);
+create index role_assignments_room_id_idx on role_assignments(room_id);
 
 alter table rooms enable row level security;
 alter table members enable row level security;
 alter table draws enable row level security;
+alter table role_preferences enable row level security;
+alter table role_assignments enable row level security;
 
 create policy rooms_open on rooms for all using (true) with check (true);
 create policy members_open on members for all using (true) with check (true);
 create policy draws_open on draws for all using (true) with check (true);
+create policy role_preferences_open on role_preferences for all using (true) with check (true);
+create policy role_assignments_open on role_assignments for all using (true) with check (true);
 
 -- 실시간 반영 — 같은 방을 열어둔 다른 사람 화면에 즉시 보이게 한다.
 alter publication supabase_realtime add table public.rooms;
 alter publication supabase_realtime add table public.members;
 alter publication supabase_realtime add table public.draws;
+alter publication supabase_realtime add table public.role_preferences;
+alter publication supabase_realtime add table public.role_assignments;
 
 -- ============================================================
 -- draw_winner: 가중치 기반 뽑기를 원자적으로 처리하는 함수.
@@ -117,8 +155,37 @@ grant execute on function draw_winner(uuid) to anon, authenticated;
 
 -- ============================================================
 -- 마이그레이션: 이미 이 스키마로 세팅된(=위 create table을 이미 실행한) 프로젝트에는
--- 위 전체를 다시 실행할 수 없다(테이블이 이미 있어서 에러). 그런 경우 이 두 줄만
--- SQL Editor에서 실행하면 problem_type/situation 컬럼이 추가된다.
+-- 위 전체를 다시 실행할 수 없다(테이블이 이미 있어서 에러). 그런 경우 이 블록만
+-- SQL Editor에서 실행한다.
 -- ============================================================
--- alter table rooms add column if not exists problem_type text not null default 'role_assignment';
--- alter table rooms add column if not exists situation text;
+alter table rooms add column if not exists problem_type text not null default 'role_assignment';
+alter table rooms add column if not exists situation text;
+alter table rooms add column if not exists game_phase text not null default 'lobby';
+
+create table if not exists role_preferences (
+  id         uuid primary key default gen_random_uuid(),
+  room_id    uuid not null references rooms(id) on delete cascade,
+  member_id  uuid not null references members(id) on delete cascade,
+  role_label text not null,
+  rank       int not null default 1,
+  created_at timestamptz not null default now(),
+  unique (room_id, member_id, rank)
+);
+
+create table if not exists role_assignments (
+  id          uuid primary key default gen_random_uuid(),
+  room_id     uuid not null references rooms(id) on delete cascade,
+  role_label  text not null,
+  member_id   uuid references members(id) on delete set null,
+  member_name text not null,
+  resolved_by text not null default 'preference',
+  round       int not null,
+  created_at  timestamptz not null default now()
+);
+
+alter table role_preferences enable row level security;
+alter table role_assignments enable row level security;
+create policy role_preferences_open on role_preferences for all using (true) with check (true);
+create policy role_assignments_open on role_assignments for all using (true) with check (true);
+alter publication supabase_realtime add table public.role_preferences;
+alter publication supabase_realtime add table public.role_assignments;

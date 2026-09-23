@@ -1,12 +1,12 @@
-// src/lib/situations.ts — "상황" 카탈로그. 하드코딩된 페이지를 여러 개 만드는 대신
-// 이 데이터 구조에 항목을 추가/수정하는 것만으로 상황을 늘릴 수 있게 한다.
-// taskHint는 방 만들기 단계에서 입력창 placeholder로만 쓰이는 참고용 문구라, 실제
-// task 값을 강제로 채우지는 않는다(기존 방 만들기 입력 로직은 그대로 유지).
+// src/lib/situations.ts — "상황" + 그 상황에서 나눠 맡을 "역할 풀" 카탈로그.
+// 하드코딩된 페이지 대신 이 데이터 구조에 항목을 추가/수정하는 것만으로 상황과 역할을
+// 늘릴 수 있다. 방장이 역할을 직접 편집하는 UI는 다음 단계 — 지금은 상황을 고르면
+// 이 프리셋 role 목록이 그대로 방의 역할 풀이 된다.
 
 export interface Situation {
   id: string;
   label: string;
-  taskHint: string;
+  roles: string[];
 }
 
 export interface SituationCategory {
@@ -22,8 +22,16 @@ export const SITUATION_CATEGORIES: SituationCategory[] = [
     label: "대학",
     emoji: "🎓",
     situations: [
-      { id: "team-project", label: "팀플", taskHint: "자료조사, PPT, 발표..." },
-      { id: "presentation", label: "발표 준비", taskHint: "대본, 슬라이드, 리허설..." },
+      {
+        id: "team-project",
+        label: "팀플",
+        roles: ["발표", "자료조사", "PPT·디자인", "개발·실습"],
+      },
+      {
+        id: "presentation",
+        label: "발표 준비",
+        roles: ["대본 작성", "슬라이드 제작", "리허설 진행", "Q&A 준비"],
+      },
     ],
   },
   {
@@ -31,8 +39,16 @@ export const SITUATION_CATEGORIES: SituationCategory[] = [
     label: "직장",
     emoji: "💼",
     situations: [
-      { id: "meeting", label: "회의", taskHint: "회의 진행, 회의록, 일정 관리..." },
-      { id: "project", label: "프로젝트", taskHint: "기획, 개발, QA..." },
+      {
+        id: "meeting",
+        label: "회의",
+        roles: ["회의 진행", "회의록 작성", "자료 준비", "일정 조율"],
+      },
+      {
+        id: "project",
+        label: "프로젝트",
+        roles: ["기획", "개발", "디자인", "QA"],
+      },
     ],
   },
   {
@@ -40,8 +56,27 @@ export const SITUATION_CATEGORIES: SituationCategory[] = [
     label: "집",
     emoji: "🏠",
     situations: [
-      { id: "chores", label: "집안일", taskHint: "설거지, 청소, 쓰레기, 장보기..." },
-      { id: "roommate", label: "룸메이트 생활", taskHint: "공과금, 장보기, 청소 당번..." },
+      {
+        id: "chores",
+        label: "집안일",
+        roles: ["설거지", "청소", "쓰레기 버리기", "장보기"],
+      },
+      {
+        id: "roommate",
+        label: "룸메이트 생활",
+        roles: ["공과금 관리", "장보기", "청소 당번", "분리수거"],
+      },
     ],
   },
 ];
+
+export function findSituation(
+  situationId: string | null | undefined
+): { category: SituationCategory; situation: Situation } | null {
+  if (!situationId) return null;
+  for (const category of SITUATION_CATEGORIES) {
+    const situation = category.situations.find((s) => s.id === situationId);
+    if (situation) return { category, situation };
+  }
+  return null;
+}
