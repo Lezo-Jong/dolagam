@@ -30,6 +30,9 @@ export interface Member {
   created_at: string;
   // 역할 충돌 시 쓸 수 있는 우선권을 이미 썼는지 — 라운드마다 1개, restartRound에서 초기화.
   priority_token_used: boolean;
+  // 🃏 카드(우선권보다 약하고 승부보다 강한 충돌 해결 수단)를 이미 썼는지 — 마찬가지로
+  // 라운드마다 1개, restartRound에서 초기화.
+  card_token_used: boolean;
 }
 
 export interface Draw {
@@ -66,9 +69,10 @@ export interface RoleAssignment {
   member_name: string;
   // 몇 지망이 반영됐는지 — 비선호 역할로 배정되면 null.
   assigned_rank: number | null;
-  // 'preference'=충돌 없이 그대로, 'priority'=우선권으로 획득, 'duel'=승부(가위바위보
-  // 포함)로 획득, 'draw'=마지막 무작위 매칭(비선호) 또는 3명 이상 동률 시 뽑기.
-  resolved_by: "preference" | "priority" | "duel" | "draw";
+  // 'preference'=충돌 없이 그대로, 'priority'=우선권으로 획득, 'card'=카드로 획득,
+  // 'duel'=승부(가위바위보 포함)로 획득, 'draw'=마지막 무작위 매칭(비선호) 또는 3명
+  // 이상 동률 시 뽑기, 'trade'=결과 확정 후 다른 참가자와 역할을 맞바꿈.
+  resolved_by: "preference" | "priority" | "card" | "duel" | "draw" | "trade";
   round: number;
   created_at: string;
   // 이 역할에 연결된 능력이 있으면 배정 시점의 능력/선호 스냅샷(둘 다 0~3). 연결된
@@ -78,7 +82,7 @@ export interface RoleAssignment {
   preference_level: number | null;
 }
 
-export type ConflictChoice = "priority" | "concede" | "duel";
+export type ConflictChoice = "priority" | "concede" | "duel" | "card";
 export type RpsMove = "rock" | "paper" | "scissors";
 
 export interface SkillSnapshot {
@@ -96,7 +100,7 @@ export interface RoleConflict {
   finalist_ids: string[] | null;
   status: "choosing" | "rps" | "resolved";
   winner_id: string | null;
-  winner_reason: "priority" | "duel" | "draw" | null;
+  winner_reason: "priority" | "card" | "duel" | "draw" | null;
   created_at: string;
   // 충돌이 생긴 시점의 후보별 능력/선호 스냅샷: { [member_id]: {skill_level, preference_level} }.
   // 연결된 능력이 없는 역할이면 null.
@@ -139,4 +143,17 @@ export interface PlayerSkill {
   skill_level: number;
   preference_level: number;
   updated_at: string;
+}
+
+// 결과 확정 후 "이 역할 서로 바꿀래?" 제안. 제안자(proposer)가 대상(target)에게 보내고,
+// 대상이 수락하면 두 사람의 role_assignments.role_label을 맞바꾼다(양쪽 동의 필요 —
+// 한쪽 마음대로 못 바꾼다).
+export interface RoleSwapProposal {
+  id: string;
+  room_id: string;
+  round: number;
+  proposer_id: string;
+  target_id: string;
+  status: "pending" | "accepted" | "declined";
+  created_at: string;
 }

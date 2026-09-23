@@ -44,7 +44,10 @@ create table members (
   created_at           timestamptz not null default now(),
   -- 역할 충돌 시 쓸 수 있는 우선권. 게임(라운드)마다 1개씩 새로 주어지고, 한 번 쓰면
   -- 그 라운드 동안은 다시 못 쓴다(restartRound에서 초기화됨).
-  priority_token_used  boolean not null default false
+  priority_token_used  boolean not null default false,
+  -- 🃏 카드 — 우선권보다는 약하지만 승부보다는 강한 새 충돌 해결 수단. 우선권과
+  -- 마찬가지로 라운드마다 1개, 안 그러면 승부(가위바위보)를 고를 이유가 없어진다.
+  card_token_used      boolean not null default false
 );
 
 -- 뽑기 기록. member_id는 멤버가 삭제되면 null로 풀리지만(on delete set null),
@@ -171,6 +174,20 @@ create table player_skills (
   unique (room_id, member_id, skill_category)
 );
 
+-- 결과가 나온 뒤 "내 역할이랑 바꾸자" 제안/수락. 라운드별로 스코프해서 다음 라운드로
+-- 넘어가면(restartRound) 자동으로 정리된다. 수락되면 role_assignments 두 행의
+-- role_label(+그 역할에 맞는 능력 스냅샷)을 서로 바꾼다 — 사람이 바뀌는 게 아니라
+-- 같은 라운드 안에서 역할만 맞바꾸는 것이라 별도 배정 이력을 새로 만들지 않는다.
+create table role_swap_proposals (
+  id          uuid primary key default gen_random_uuid(),
+  room_id     uuid not null references rooms(id) on delete cascade,
+  round       int not null,
+  proposer_id uuid not null references members(id) on delete cascade,
+  target_id   uuid not null references members(id) on delete cascade,
+  status      text not null default 'pending', -- 'pending' | 'accepted' | 'declined'
+  created_at  timestamptz not null default now()
+);
+
 create index members_room_id_idx on members(room_id);
 create index draws_room_id_idx on draws(room_id);
 create index role_preferences_room_id_idx on role_preferences(room_id);
@@ -180,6 +197,7 @@ create index role_conflict_choices_conflict_id_idx on role_conflict_choices(conf
 create index role_conflict_choices_room_id_idx on role_conflict_choices(room_id);
 create index custom_roles_room_id_idx on custom_roles(room_id);
 create index player_skills_room_id_idx on player_skills(room_id);
+create index role_swap_proposals_room_id_idx on role_swap_proposals(room_id);
 
 alter table rooms enable row level security;
 alter table members enable row level security;
@@ -190,6 +208,7 @@ alter table role_conflicts enable row level security;
 alter table role_conflict_choices enable row level security;
 alter table custom_roles enable row level security;
 alter table player_skills enable row level security;
+alter table role_swap_proposals enable row level security;
 
 create policy rooms_open on rooms for all using (true) with check (true);
 create policy members_open on members for all using (true) with check (true);
@@ -200,6 +219,7 @@ create policy role_conflicts_open on role_conflicts for all using (true) with ch
 create policy role_conflict_choices_open on role_conflict_choices for all using (true) with check (true);
 create policy custom_roles_open on custom_roles for all using (true) with check (true);
 create policy player_skills_open on player_skills for all using (true) with check (true);
+create policy role_swap_proposals_open on role_swap_proposals for all using (true) with check (true);
 
 -- 실시간 반영 — 같은 방을 열어둔 다른 사람 화면에 즉시 보이게 한다.
 alter publication supabase_realtime add table public.rooms;
@@ -210,6 +230,7 @@ alter publication supabase_realtime add table public.role_assignments;
 alter publication supabase_realtime add table public.role_conflicts;
 alter publication supabase_realtime add table public.role_conflict_choices;
 alter publication supabase_realtime add table public.custom_roles;
+alter publication supabase_realtime add table public.role_swap_proposals;
 alter publication supabase_realtime add table public.player_skills;
 
 -- 기본 REPLICA IDENTITY(기본키만)로는 DELETE된 행의 room_id를 알 수 없어서, room_id로
@@ -223,6 +244,7 @@ alter table role_conflicts replica identity full;
 alter table role_conflict_choices replica identity full;
 alter table custom_roles replica identity full;
 alter table player_skills replica identity full;
+alter table role_swap_proposals replica identity full;
 
 -- ============================================================
 -- draw_winner: 가중치 기반 뽑기를 원자적으로 처리하는 함수.
@@ -435,3 +457,26 @@ alter table player_skills enable row level security;
 create policy player_skills_open on player_skills for all using (true) with check (true);
 alter publication supabase_realtime add table public.player_skills;
 alter table player_skills replica identity full;
+
+-- ============================================================
+-- 마이그레이션 7: 새 충돌 해결 액션(🃏 카드) + 결과 확정 후 역할 교환 협상.
+-- 카드는 resolved_by에 새 값 'card'가 추가되는 것뿐이라 role_assignments 스키마
+-- 변경은 없다(원래 자유 텍스트 컬럼). 교환은 role_swap_proposals 테이블 하나로 처리.
+-- ============================================================
+alter table members add column if not exists card_token_used boolean not null default false;
+
+create table if not exists role_swap_proposals (
+  id          uuid primary key default gen_random_uuid(),
+  room_id     uuid not null references rooms(id) on delete cascade,
+  round       int not null,
+  proposer_id uuid not null references members(id) on delete cascade,
+  target_id   uuid not null references members(id) on delete cascade,
+  status      text not null default 'pending',
+  created_at  timestamptz not null default now()
+);
+
+create index if not exists role_swap_proposals_room_id_idx on role_swap_proposals(room_id);
+alter table role_swap_proposals enable row level security;
+create policy role_swap_proposals_open on role_swap_proposals for all using (true) with check (true);
+alter publication supabase_realtime add table public.role_swap_proposals;
+alter table role_swap_proposals replica identity full;

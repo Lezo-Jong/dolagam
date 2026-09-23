@@ -10,9 +10,12 @@ import { useRouter } from "next/navigation";
 import {
   addCustomRole,
   addMember,
+  cancelSwapProposal,
   deleteCustomRole,
+  proposeSwap,
   removeMember,
   resolveRoles,
+  respondToSwap,
   restartRound,
   setPreferenceLevel,
   setSkillLevel,
@@ -34,6 +37,7 @@ import type {
   RoleConflict,
   RoleConflictChoice,
   RolePreference,
+  RoleSwapProposal,
   RpsMove,
 } from "@/lib/types";
 
@@ -46,6 +50,7 @@ export function RoleGameView({
   initialConflictChoices,
   initialCustomRoles,
   initialPlayerSkills,
+  initialSwapProposals,
   recommendedRoles,
   skillCategories,
   situationLabel,
@@ -59,6 +64,7 @@ export function RoleGameView({
   initialConflictChoices: RoleConflictChoice[];
   initialCustomRoles: CustomRole[];
   initialPlayerSkills: PlayerSkill[];
+  initialSwapProposals: RoleSwapProposal[];
   recommendedRoles: string[];
   skillCategories: string[];
   situationLabel: string;
@@ -74,6 +80,7 @@ export function RoleGameView({
   const [conflictChoices, setConflictChoices] = useState(initialConflictChoices);
   const [customRoles, setCustomRoles] = useState(initialCustomRoles);
   const [playerSkills, setPlayerSkills] = useState(initialPlayerSkills);
+  const [swapProposals, setSwapProposals] = useState(initialSwapProposals);
 
   // 이번 게임에서 실제로 쓰기로 고른 역할들("게임 시작" 누르기 전까지는 이 브라우저만
   // 아는 초안이다 — 다 같이 실시간으로 체크박스를 맞출 필요까진 없어서 로컬로 둔다).
@@ -281,6 +288,19 @@ export function RoleGameView({
           });
         }
       )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "role_swap_proposals", filter: `room_id=eq.${room.id}` },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            const old = payload.old as Partial<RoleSwapProposal>;
+            setSwapProposals((current) => current.filter((p) => p.id !== old.id));
+            return;
+          }
+          const next = payload.new as RoleSwapProposal;
+          setSwapProposals((current) => [...current.filter((p) => p.id !== next.id), next]);
+        }
+      )
       .subscribe();
 
     return () => {
@@ -436,6 +456,21 @@ export function RoleGameView({
     });
   }
 
+  function handleProposeSwap(targetId: string) {
+    if (!myMemberId) return;
+    proposeSwap(room.id, room.round, myMemberId, targetId);
+  }
+
+  function handleCancelSwap(proposalId: string) {
+    if (!myMemberId) return;
+    cancelSwapProposal(proposalId, myMemberId);
+  }
+
+  function handleRespondSwap(proposalId: string, accept: boolean) {
+    if (!myMemberId) return;
+    respondToSwap(proposalId, myMemberId, accept);
+  }
+
   function handleLeave() {
     if (myMemberId) {
       removeMember(myMemberId);
@@ -463,6 +498,19 @@ export function RoleGameView({
   const workingRound = room.round + 1;
   const settledThisRound = assignments.filter((a) => a.round === workingRound);
   const activeConflicts = conflicts.filter((c) => c.round === workingRound && c.status !== "resolved");
+
+  // 결과 확정 후 역할 교환 — 이번 라운드에 걸린 대기 중인 제안 중 내가 보낸 것/받은 것.
+  // 한 번에 하나씩만 진행하게 해서(서버에서도 같은 규칙으로 막는다) 여러 제안이 얽혀
+  // 헷갈리는 상황을 피한다.
+  const myResultAssignment =
+    assignments.find((a) => a.round === room.round && a.member_id === myMemberId) ?? null;
+  const roundSwapProposals = swapProposals.filter((p) => p.round === room.round);
+  const myOutgoingSwap = myMemberId
+    ? roundSwapProposals.find((p) => p.status === "pending" && p.proposer_id === myMemberId) ?? null
+    : null;
+  const myIncomingSwap = myMemberId
+    ? roundSwapProposals.find((p) => p.status === "pending" && p.target_id === myMemberId) ?? null
+    : null;
 
   return (
     <div className="mx-auto flex w-full max-w-md flex-1 flex-col gap-6 px-4 py-8">
@@ -839,6 +887,7 @@ export function RoleGameView({
                 choices={conflictChoices}
                 myMemberId={myMemberId}
                 myPriorityUsed={me?.priority_token_used ?? false}
+                myCardUsed={me?.card_token_used ?? false}
                 onChoice={handleConflictChoice}
                 onRpsMove={handleRpsMove}
               />
@@ -858,27 +907,84 @@ export function RoleGameView({
                 <p className="text-sm text-zinc-500">이번 게임의 최종 결과예요.</p>
               </div>
 
+              {myIncomingSwap && (
+                <div className="rounded-2xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-700 dark:bg-amber-950">
+                  <p className="text-sm text-zinc-700 dark:text-zinc-200">
+                    <strong>{members.find((m) => m.id === myIncomingSwap.proposer_id)?.name}</strong>
+                    님이 역할을 서로 바꾸자고 제안했어요.
+                  </p>
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      onClick={() => handleRespondSwap(myIncomingSwap.id, true)}
+                      className="flex-1 rounded-xl bg-zinc-900 py-2 text-sm font-semibold text-white dark:bg-zinc-50 dark:text-zinc-900"
+                    >
+                      수락
+                    </button>
+                    <button
+                      onClick={() => handleRespondSwap(myIncomingSwap.id, false)}
+                      className="flex-1 rounded-xl border border-zinc-300 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:text-zinc-300"
+                    >
+                      거절
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="flex flex-col gap-2">
                 {assignments
                   .filter((a) => a.round === room.round)
-                  .map((a) => (
-                    <div
-                      key={a.id}
-                      className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
-                    >
-                      <p className="text-sm text-zinc-400">👤 {a.member_name}</p>
-                      <p className="mt-1 text-lg font-bold text-zinc-900 dark:text-zinc-50">{a.role_label}</p>
-                      <div className="mt-1 flex items-center gap-2 text-sm text-zinc-500">
-                        <span>{rankBadge(a.assigned_rank)}</span>
-                        {resolutionTag(a.resolved_by) && <span>· {resolutionTag(a.resolved_by)}</span>}
-                      </div>
-                      {a.skill_level != null && (
-                        <p className="mt-1 text-xs text-zinc-400">
-                          능력 {skillStars(a.skill_level) || "–"} · 선호 {prefHearts(a.preference_level) || "–"}
+                  .map((a) => {
+                    const isMe = a.member_id === myMemberId;
+                    const canPropose =
+                      !isMe &&
+                      myMemberId != null &&
+                      a.member_id != null &&
+                      myResultAssignment != null &&
+                      a.role_label !== myResultAssignment.role_label &&
+                      !myOutgoingSwap &&
+                      !myIncomingSwap;
+                    const isMyOutgoingTarget = myOutgoingSwap?.target_id === a.member_id;
+                    return (
+                      <div
+                        key={a.id}
+                        className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
+                      >
+                        <p className="text-sm text-zinc-400">
+                          👤 {a.member_name}
+                          {isMe && " (나)"}
                         </p>
-                      )}
-                    </div>
-                  ))}
+                        <p className="mt-1 text-lg font-bold text-zinc-900 dark:text-zinc-50">{a.role_label}</p>
+                        <div className="mt-1 flex items-center gap-2 text-sm text-zinc-500">
+                          <span>{rankBadge(a.assigned_rank)}</span>
+                          {resolutionTag(a.resolved_by) && <span>· {resolutionTag(a.resolved_by)}</span>}
+                        </div>
+                        {a.skill_level != null && (
+                          <p className="mt-1 text-xs text-zinc-400">
+                            능력 {skillStars(a.skill_level) || "–"} · 선호 {prefHearts(a.preference_level) || "–"}
+                          </p>
+                        )}
+                        {canPropose && (
+                          <button
+                            onClick={() => handleProposeSwap(a.member_id!)}
+                            className="mt-2 rounded-lg border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-600 hover:border-zinc-900 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-50"
+                          >
+                            🔄 교환 제안
+                          </button>
+                        )}
+                        {isMyOutgoingTarget && (
+                          <div className="mt-2 flex items-center gap-2 text-xs text-zinc-500">
+                            <span>응답 대기 중...</span>
+                            <button
+                              onClick={() => handleCancelSwap(myOutgoingSwap!.id)}
+                              className="text-zinc-400 hover:text-red-500"
+                            >
+                              취소
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
               </div>
             </>
           ) : (
@@ -1118,7 +1224,9 @@ function SkillRatingSection({
 
 function resolutionTag(resolvedBy: RoleAssignment["resolved_by"]): string | null {
   if (resolvedBy === "priority") return "🔥 우선권으로 획득";
+  if (resolvedBy === "card") return "🃏 카드로 획득";
   if (resolvedBy === "duel") return "🎲 승부에서 승리";
+  if (resolvedBy === "trade") return "🔄 협상으로 교환";
   return null;
 }
 
@@ -1128,6 +1236,7 @@ function ConflictCard({
   choices,
   myMemberId,
   myPriorityUsed,
+  myCardUsed,
   onChoice,
   onRpsMove,
 }: {
@@ -1136,6 +1245,7 @@ function ConflictCard({
   choices: RoleConflictChoice[];
   myMemberId: string | null;
   myPriorityUsed: boolean;
+  myCardUsed: boolean;
   onChoice: (conflictId: string, choice: ConflictChoice) => void;
   onRpsMove: (conflictId: string, move: RpsMove) => void;
 }) {
@@ -1186,28 +1296,36 @@ function ConflictCard({
         ) : myChoice?.choice ? (
           <p className="mt-2 text-sm text-zinc-500">선택 완료! 상대를 기다리는 중...</p>
         ) : (
-          <div className="mt-2 flex gap-2">
+          <div className="mt-2 grid grid-cols-2 gap-2">
             <button
               type="button"
               onClick={() => onChoice(conflict.id, "priority")}
               disabled={myPriorityUsed}
-              className="flex-1 rounded-xl border border-zinc-300 py-2 text-sm transition-colors hover:border-zinc-900 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700 dark:hover:border-zinc-50"
+              className="rounded-xl border border-zinc-300 py-2 text-sm transition-colors hover:border-zinc-900 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700 dark:hover:border-zinc-50"
             >
               🔥 우선권
             </button>
             <button
               type="button"
-              onClick={() => onChoice(conflict.id, "concede")}
-              className="flex-1 rounded-xl border border-zinc-300 py-2 text-sm transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:hover:border-zinc-50"
+              onClick={() => onChoice(conflict.id, "card")}
+              disabled={myCardUsed}
+              className="rounded-xl border border-zinc-300 py-2 text-sm transition-colors hover:border-zinc-900 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700 dark:hover:border-zinc-50"
             >
-              🤝 양보
+              🃏 카드
             </button>
             <button
               type="button"
               onClick={() => onChoice(conflict.id, "duel")}
-              className="flex-1 rounded-xl border border-zinc-300 py-2 text-sm transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:hover:border-zinc-50"
+              className="rounded-xl border border-zinc-300 py-2 text-sm transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:hover:border-zinc-50"
             >
               🎲 승부
+            </button>
+            <button
+              type="button"
+              onClick={() => onChoice(conflict.id, "concede")}
+              className="rounded-xl border border-zinc-300 py-2 text-sm transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:hover:border-zinc-50"
+            >
+              🤝 양보
             </button>
           </div>
         ))}

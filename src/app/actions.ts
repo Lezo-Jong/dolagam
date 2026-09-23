@@ -552,7 +552,7 @@ async function finalizeConflict(
     candidate_skills: Record<string, SkillSnapshot> | null;
   },
   winnerId: string,
-  reason: "priority" | "duel" | "draw"
+  reason: "priority" | "card" | "duel" | "draw"
 ): Promise<void> {
   const { data: winner } = await supabase.from("members").select("*").eq("id", winnerId).maybeSingle();
   if (!winner) return;
@@ -621,11 +621,15 @@ async function claimConflict(
 }
 
 // 충돌 하나(role_conflicts 한 행)에 걸린 선택이 다 모였는지 보고, 다 모였으면 규칙대로
-// 판정한다 — 이 판정 규칙표가 이 기능의 핵심이다.
+// 판정한다 — 이 판정 규칙표가 이 기능의 핵심이다. 세기는 우선권 > 카드 > 승부 순.
 //   양보만 있으면(전원 양보): 아무도 못 받음 -> 다음 지망으로 이월
 //   경쟁자가 1명만 남으면: 그 사람이 바로 승리
-//   우선권 사용자가 있으면: 우선권 사용자끼리만(1명이면 바로 승리, 2명이면 가위바위보)
-//   전원 승부(우선권 없이): 다 같이 가위바위보(2명 초과면 예외적으로 가중치 뽑기)
+//   우선권 사용자가 있으면: 우선권 사용자끼리만(1명이면 바로 승리, 2명이면 가위바위보,
+//     3명 이상이면 가중치 뽑기)
+//   우선권 없이 카드 사용자가 있으면: 카드 사용자끼리만, 가위바위보로 가지 않고 항상
+//     가중치 뽑기로 바로 정한다(승부/가위바위보와는 다른 결의 해결 수단이라는 걸
+//     구분하기 위해서다)
+//   전원 승부(우선권·카드 없이): 다 같이 가위바위보(2명 초과면 예외적으로 가중치 뽑기)
 async function tryResolveConflict(supabase: ReturnType<typeof getSupabase>, conflictId: string) {
   const { data: conflict } = await supabase
     .from("role_conflicts")
@@ -657,17 +661,30 @@ async function tryResolveConflict(supabase: ReturnType<typeof getSupabase>, conf
 
     if (contenders.length === 1) {
       const winnerChoice = choiceByMember.get(contenders[0])?.choice;
+      const reason = winnerChoice === "priority" ? "priority" : winnerChoice === "card" ? "card" : "duel";
       if (!(await claimConflict(supabase, conflictId, "choosing", "resolved"))) return;
-      await finalizeConflict(supabase, conflict, contenders[0], winnerChoice === "priority" ? "priority" : "duel");
+      await finalizeConflict(supabase, conflict, contenders[0], reason);
       return;
     }
 
     const priorityUsers = contenders.filter((id) => choiceByMember.get(id)?.choice === "priority");
-    const finalists = priorityUsers.length > 0 ? priorityUsers : contenders;
+    const cardUsers = contenders.filter((id) => choiceByMember.get(id)?.choice === "card");
+    const tier: "priority" | "card" | "duel" =
+      priorityUsers.length > 0 ? "priority" : cardUsers.length > 0 ? "card" : "duel";
+    const finalists = tier === "priority" ? priorityUsers : tier === "card" ? cardUsers : contenders;
 
     if (finalists.length === 1) {
       if (!(await claimConflict(supabase, conflictId, "choosing", "resolved"))) return;
-      await finalizeConflict(supabase, conflict, finalists[0], priorityUsers.length > 0 ? "priority" : "duel");
+      await finalizeConflict(supabase, conflict, finalists[0], tier);
+      return;
+    }
+
+    if (tier === "card") {
+      // 카드 동률은 가위바위보로 넘기지 않고 항상 가중치 뽑기로 바로 정한다.
+      if (!(await claimConflict(supabase, conflictId, "choosing", "resolved"))) return;
+      const { data: members } = await supabase.from("members").select("*").in("id", finalists);
+      const winner = weightedPick((members ?? []) as Member[], conflict.round);
+      await finalizeConflict(supabase, conflict, winner.id, "card");
       return;
     }
 
@@ -735,12 +752,12 @@ export async function resolveRoles(roomId: string) {
   return { ok: true as const };
 }
 
-// choice: 'priority'(우선권 사용) | 'concede'(양보) | 'duel'(승부).
+// choice: 'priority'(우선권 사용) | 'concede'(양보) | 'duel'(승부) | 'card'(카드 사용).
 export async function submitConflictChoice(
   roomId: string,
   conflictId: string,
   memberId: string,
-  choice: "priority" | "concede" | "duel"
+  choice: "priority" | "concede" | "duel" | "card"
 ) {
   const supabase = getSupabase();
 
@@ -754,6 +771,18 @@ export async function submitConflictChoice(
       return { ok: false as const, error: "우선권을 이미 사용했어요" };
     }
     await supabase.from("members").update({ priority_token_used: true }).eq("id", memberId);
+  }
+
+  if (choice === "card") {
+    const { data: member } = await supabase
+      .from("members")
+      .select("card_token_used")
+      .eq("id", memberId)
+      .maybeSingle();
+    if (member?.card_token_used) {
+      return { ok: false as const, error: "카드를 이미 사용했어요" };
+    }
+    await supabase.from("members").update({ card_token_used: true }).eq("id", memberId);
   }
 
   const { error } = await supabase
@@ -794,6 +823,133 @@ export async function restartRound(roomId: string) {
   const supabase = getSupabase();
   await supabase.from("role_conflicts").delete().eq("room_id", roomId);
   await supabase.from("role_preferences").delete().eq("room_id", roomId);
-  await supabase.from("members").update({ priority_token_used: false }).eq("room_id", roomId);
+  // 아직 응답 안 된 교환 제안은 새 라운드로 넘어가면 의미가 없어진다(대상 역할이 곧
+  // 다시 정해지므로).
+  await supabase.from("role_swap_proposals").delete().eq("room_id", roomId);
+  await supabase
+    .from("members")
+    .update({ priority_token_used: false, card_token_used: false })
+    .eq("room_id", roomId);
   await supabase.from("rooms").update({ game_phase: "lobby", conflict_rank: 0 }).eq("id", roomId);
+}
+
+// ============================================================
+// 결과 확정 후 역할 교환 — 두 참가자가 서로 다른 역할을 받았을 때, 한쪽이 제안하고
+// 다른 쪽이 수락해야만(양쪽 동의) role_assignments.role_label을 맞바꾼다. 능력/선호
+// 스냅샷도 각자 "새로 받는 역할" 기준으로 다시 찍는다 — 역할마다 연결된 능력 카테고리가
+// 다를 수 있어서 그냥 두 값을 맞바꾸면 엉뚱한 능력이 표시될 수 있기 때문이다.
+// ============================================================
+
+export async function proposeSwap(roomId: string, round: number, proposerId: string, targetId: string) {
+  if (proposerId === targetId) return { ok: false as const, error: "자기 자신과는 교환할 수 없어요" };
+  const supabase = getSupabase();
+
+  const { data: existing } = await supabase
+    .from("role_swap_proposals")
+    .select("id")
+    .eq("room_id", roomId)
+    .eq("round", round)
+    .eq("status", "pending")
+    .or(`proposer_id.eq.${proposerId},target_id.eq.${proposerId}`);
+  if (existing && existing.length > 0) {
+    return { ok: false as const, error: "이미 진행 중인 교환 제안이 있어요" };
+  }
+
+  const { error } = await supabase.from("role_swap_proposals").insert({
+    room_id: roomId,
+    round,
+    proposer_id: proposerId,
+    target_id: targetId,
+    status: "pending",
+  });
+  if (error) return { ok: false as const, error: "제안을 보내지 못했어요" };
+  return { ok: true as const };
+}
+
+export async function cancelSwapProposal(proposalId: string, memberId: string) {
+  const supabase = getSupabase();
+  const { data: proposal } = await supabase
+    .from("role_swap_proposals")
+    .select("proposer_id, status")
+    .eq("id", proposalId)
+    .maybeSingle();
+  if (!proposal || proposal.proposer_id !== memberId || proposal.status !== "pending") {
+    return { ok: false as const, error: "취소할 수 없어요" };
+  }
+  await supabase.from("role_swap_proposals").delete().eq("id", proposalId);
+  return { ok: true as const };
+}
+
+export async function respondToSwap(proposalId: string, responderId: string, accept: boolean) {
+  const supabase = getSupabase();
+  const { data: proposal } = await supabase
+    .from("role_swap_proposals")
+    .select("*")
+    .eq("id", proposalId)
+    .maybeSingle();
+  if (!proposal || proposal.status !== "pending" || proposal.target_id !== responderId) {
+    return { ok: false as const, error: "응답할 수 없는 제안이에요" };
+  }
+
+  if (!accept) {
+    await supabase.from("role_swap_proposals").update({ status: "declined" }).eq("id", proposalId);
+    return { ok: true as const };
+  }
+
+  const { data: room } = await supabase.from("rooms").select("*").eq("id", proposal.room_id).maybeSingle();
+  if (!room) return { ok: false as const, error: "방을 찾을 수 없어요" };
+  const situationInfo = findSituation(room.situation);
+
+  const { data: assignments } = await supabase
+    .from("role_assignments")
+    .select("*")
+    .eq("room_id", proposal.room_id)
+    .eq("round", proposal.round)
+    .in("member_id", [proposal.proposer_id, proposal.target_id]);
+  const proposerRow = (assignments ?? []).find((a) => a.member_id === proposal.proposer_id);
+  const targetRow = (assignments ?? []).find((a) => a.member_id === proposal.target_id);
+  if (!proposerRow || !targetRow) {
+    return { ok: false as const, error: "교환할 역할을 찾을 수 없어요" };
+  }
+
+  // 서로 새로 받는 역할 기준으로 능력/선호 스냅샷을 다시 찍는다.
+  let proposerNewSkill: SkillSnapshot | null = null;
+  let targetNewSkill: SkillSnapshot | null = null;
+  if (situationInfo) {
+    const targetRoleSkill = await getRoleSkillCategory(supabase, proposal.room_id, situationInfo.situation, targetRow.role_label);
+    const proposerRoleSkill = await getRoleSkillCategory(supabase, proposal.room_id, situationInfo.situation, proposerRow.role_label);
+    proposerNewSkill = await getSkillSnapshot(supabase, proposal.room_id, proposal.proposer_id, targetRoleSkill);
+    targetNewSkill = await getSkillSnapshot(supabase, proposal.room_id, proposal.target_id, proposerRoleSkill);
+  }
+
+  await supabase
+    .from("role_assignments")
+    .update({
+      role_label: targetRow.role_label,
+      resolved_by: "trade",
+      skill_level: proposerNewSkill?.skill_level ?? null,
+      preference_level: proposerNewSkill?.preference_level ?? null,
+    })
+    .eq("id", proposerRow.id);
+  await supabase
+    .from("role_assignments")
+    .update({
+      role_label: proposerRow.role_label,
+      resolved_by: "trade",
+      skill_level: targetNewSkill?.skill_level ?? null,
+      preference_level: targetNewSkill?.preference_level ?? null,
+    })
+    .eq("id", targetRow.id);
+
+  await supabase.from("role_swap_proposals").update({ status: "accepted" }).eq("id", proposalId);
+  // 둘 중 한쪽이 걸린 다른 대기 중인 제안은 더 이상 유효하지 않다(역할이 이미 바뀌었으니).
+  await supabase
+    .from("role_swap_proposals")
+    .update({ status: "declined" })
+    .eq("room_id", proposal.room_id)
+    .eq("round", proposal.round)
+    .eq("status", "pending")
+    .or(`proposer_id.eq.${proposal.proposer_id},target_id.eq.${proposal.proposer_id},proposer_id.eq.${proposal.target_id},target_id.eq.${proposal.target_id}`);
+
+  return { ok: true as const };
 }

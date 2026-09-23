@@ -11,6 +11,7 @@ import type {
   RoleConflict,
   RoleConflictChoice,
   RolePreference,
+  RoleSwapProposal,
 } from "@/lib/types";
 import { RoomView } from "@/components/RoomView";
 import { RoleGameView } from "@/components/RoleGameView";
@@ -45,6 +46,7 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
       { data: conflictChoices },
       { data: customRoles },
       { data: playerSkills },
+      { data: swapProposals },
     ] = await Promise.all([
       supabase.from("role_preferences").select("*").eq("room_id", room.id),
       supabase.from("role_assignments").select("*").eq("room_id", room.id),
@@ -52,6 +54,7 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
       supabase.from("role_conflict_choices").select("*").eq("room_id", room.id),
       supabase.from("custom_roles").select("*").eq("room_id", room.id).order("created_at", { ascending: true }),
       supabase.from("player_skills").select("*").eq("room_id", room.id),
+      supabase.from("role_swap_proposals").select("*").eq("room_id", room.id),
     ]);
 
     return (
@@ -64,6 +67,7 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
         initialConflictChoices={(conflictChoices ?? []) as RoleConflictChoice[]}
         initialCustomRoles={(customRoles ?? []) as CustomRole[]}
         initialPlayerSkills={(playerSkills ?? []) as PlayerSkill[]}
+        initialSwapProposals={(swapProposals ?? []) as RoleSwapProposal[]}
         recommendedRoles={situationInfo.situation.roles}
         skillCategories={situationInfo.situation.skills}
         situationLabel={`${situationInfo.category.label} · ${situationInfo.situation.label}`}
