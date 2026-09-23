@@ -6,6 +6,10 @@ export interface Room {
   task: string;
   round: number;
   created_at: string;
+  // 문제 유형/상황 선택 단계에서 채워진다. 기존 데이터는 problem_type이 기본값
+  // 'role_assignment'로 채워지고 situation은 null일 수 있다.
+  problem_type: string;
+  situation: string | null;
 }
 
 export interface Member {

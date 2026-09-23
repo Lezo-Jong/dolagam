@@ -7,11 +7,18 @@
 create extension if not exists pgcrypto; -- gen_random_uuid() 사용
 
 create table rooms (
-  id         uuid primary key default gen_random_uuid(),
-  slug       text not null unique,
-  task       text not null default '',
-  round      int not null default 0,
-  created_at timestamptz not null default now()
+  id           uuid primary key default gen_random_uuid(),
+  slug         text not null unique,
+  task         text not null default '',
+  round        int not null default 0,
+  created_at   timestamptz not null default now(),
+  -- 어떤 "문제 유형"의 방인지(src/lib/problemTypes.ts의 id). 지금은 role_assignment만
+  -- 실제로 만들 수 있지만, 다른 유형이 추가돼도 rooms 테이블을 새로 안 만들어도 되게
+  -- 컬럼으로 미리 열어둔다.
+  problem_type text not null default 'role_assignment',
+  -- 방을 만들 때 고른 상황(src/lib/situations.ts의 situation id). 참고용 정보라 선택
+  -- 안 해도 그만이라 null 허용.
+  situation    text
 );
 
 create table members (
@@ -107,3 +114,11 @@ end;
 $$;
 
 grant execute on function draw_winner(uuid) to anon, authenticated;
+
+-- ============================================================
+-- 마이그레이션: 이미 이 스키마로 세팅된(=위 create table을 이미 실행한) 프로젝트에는
+-- 위 전체를 다시 실행할 수 없다(테이블이 이미 있어서 에러). 그런 경우 이 두 줄만
+-- SQL Editor에서 실행하면 problem_type/situation 컬럼이 추가된다.
+-- ============================================================
+-- alter table rooms add column if not exists problem_type text not null default 'role_assignment';
+-- alter table rooms add column if not exists situation text;

@@ -5,7 +5,15 @@
 import { useActionState } from "react";
 import { createRoom } from "@/app/actions";
 
-export function CreateRoomForm() {
+export function CreateRoomForm({
+  problemType,
+  situation,
+  taskPlaceholder,
+}: {
+  problemType?: string;
+  situation?: string | null;
+  taskPlaceholder?: string;
+} = {}) {
   const [, formAction, pending] = useActionState(async (_prev: null, formData: FormData) => {
     await createRoom(formData);
     return null;
@@ -13,6 +21,8 @@ export function CreateRoomForm() {
 
   return (
     <form action={formAction} className="flex w-full flex-col gap-3">
+      {problemType && <input type="hidden" name="problem_type" value={problemType} />}
+      {situation && <input type="hidden" name="situation" value={situation} />}
       <label htmlFor="task" className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
         무슨 일을 정할까요?
       </label>
@@ -22,7 +32,7 @@ export function CreateRoomForm() {
         type="text"
         required
         maxLength={30}
-        placeholder="설거지, 청소, 커피 사기..."
+        placeholder={taskPlaceholder ?? "설거지, 청소, 커피 사기..."}
         className="w-full rounded-xl border border-zinc-300 bg-white px-4 py-3 text-base text-zinc-900 outline-none placeholder:text-zinc-400 focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50 dark:focus:border-zinc-50"
       />
       <button

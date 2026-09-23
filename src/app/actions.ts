@@ -9,12 +9,18 @@ import { generateSlug } from "@/lib/slug";
 
 export async function createRoom(formData: FormData) {
   const task = String(formData.get("task") ?? "").trim().slice(0, 30);
+  // 문제 유형/상황 선택 단계(홈 화면 위저드)에서 넘어온 값. 아직 그 단계를 거치지 않고
+  // 호출되더라도 기존처럼 동작하도록 기본값을 둔다.
+  const problemType = String(formData.get("problem_type") ?? "role_assignment").trim().slice(0, 30);
+  const situation = String(formData.get("situation") ?? "").trim().slice(0, 30) || null;
   const supabase = getSupabase();
 
   // slug 충돌은 극히 드물지만(8자, 53진법) 방어적으로 몇 번 재시도한다.
   for (let attempt = 0; attempt < 5; attempt++) {
     const slug = generateSlug();
-    const { error } = await supabase.from("rooms").insert({ slug, task });
+    const { error } = await supabase
+      .from("rooms")
+      .insert({ slug, task, problem_type: problemType, situation });
     if (!error) redirect(`/r/${slug}`);
     // unique 위반(23505)이면 다른 slug로 재시도, 그 외 에러는 바로 던진다.
     if (error.code !== "23505") throw new Error(error.message);
