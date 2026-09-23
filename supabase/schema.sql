@@ -29,7 +29,11 @@ create table rooms (
   -- "다음 지망으로 넘어가는 중" 락. 서로 다른 두 충돌이 거의 동시에 끝나면 두 요청이
   -- 동시에 다음 단계로 넘어가려다 결과가 중복 생성될 수 있어서, 이 값으로 한 번에
   -- 하나의 요청만 넘어가게 막는다(processNextRank 참고).
-  advancing     boolean not null default false
+  advancing     boolean not null default false,
+  -- 이번 게임(라운드)에서 실제로 쓰기로 고른 역할들 — situations.ts의 추천 역할 + 이
+  -- 방에서 만든 커스텀 역할(custom_roles) 중 체크된 것들의 이름 스냅샷. null/빈 배열이면
+  -- 아직 한 번도 고른 적 없는 방이라 추천 역할 전체를 기본값으로 쓴다(하위 호환).
+  active_roles  text[]
 );
 
 create table members (
@@ -117,6 +121,27 @@ create table role_conflict_choices (
   unique (conflict_id, member_id)
 );
 
+-- 사용자가 직접 만든 역할("내 역할"). situations.ts의 고정 role 문자열은 그대로
+-- "추천 역할"로 남고, 이 테이블은 그 위에 방마다 자유롭게 추가하는 역할을 담는다.
+-- 지금은 room_id로만 스코프해서 "이 방에서만" 쓰지만(스펙 8번), 나중에 여러 방에서
+-- 재사용하려면 room_id 대신/추가로 situation_id 기준 조회를 얹으면 된다.
+--
+-- RLS가 완전히 열려 있어 누구나 행을 고칠 수는 있지만, "만든 사람만 수정/삭제" 권한은
+-- DB가 아니라 서버 액션(updateCustomRole/deleteCustomRole)에서 created_by를 대조해서
+-- 지킨다 — 이 프로젝트 전체가 원래 그런 신뢰 모델이다(RLS는 링크 접근 통제용).
+--
+-- 과거 게임 결과(role_assignments)는 role_label을 문자열로 그대로 저장하지 이 테이블을
+-- 참조하지 않으므로, 커스텀 역할을 나중에 지워도 지난 기록의 역할 이름은 안 깨진다.
+create table custom_roles (
+  id          uuid primary key default gen_random_uuid(),
+  room_id     uuid not null references rooms(id) on delete cascade,
+  name        text not null,
+  description text,
+  created_by  uuid references members(id) on delete set null,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
 create index members_room_id_idx on members(room_id);
 create index draws_room_id_idx on draws(room_id);
 create index role_preferences_room_id_idx on role_preferences(room_id);
@@ -124,6 +149,7 @@ create index role_assignments_room_id_idx on role_assignments(room_id);
 create index role_conflicts_room_id_idx on role_conflicts(room_id);
 create index role_conflict_choices_conflict_id_idx on role_conflict_choices(conflict_id);
 create index role_conflict_choices_room_id_idx on role_conflict_choices(room_id);
+create index custom_roles_room_id_idx on custom_roles(room_id);
 
 alter table rooms enable row level security;
 alter table members enable row level security;
@@ -132,6 +158,7 @@ alter table role_preferences enable row level security;
 alter table role_assignments enable row level security;
 alter table role_conflicts enable row level security;
 alter table role_conflict_choices enable row level security;
+alter table custom_roles enable row level security;
 
 create policy rooms_open on rooms for all using (true) with check (true);
 create policy members_open on members for all using (true) with check (true);
@@ -140,6 +167,7 @@ create policy role_preferences_open on role_preferences for all using (true) wit
 create policy role_assignments_open on role_assignments for all using (true) with check (true);
 create policy role_conflicts_open on role_conflicts for all using (true) with check (true);
 create policy role_conflict_choices_open on role_conflict_choices for all using (true) with check (true);
+create policy custom_roles_open on custom_roles for all using (true) with check (true);
 
 -- 실시간 반영 — 같은 방을 열어둔 다른 사람 화면에 즉시 보이게 한다.
 alter publication supabase_realtime add table public.rooms;
@@ -149,6 +177,18 @@ alter publication supabase_realtime add table public.role_preferences;
 alter publication supabase_realtime add table public.role_assignments;
 alter publication supabase_realtime add table public.role_conflicts;
 alter publication supabase_realtime add table public.role_conflict_choices;
+alter publication supabase_realtime add table public.custom_roles;
+
+-- 기본 REPLICA IDENTITY(기본키만)로는 DELETE된 행의 room_id를 알 수 없어서, room_id로
+-- 거는 postgres_changes 필터(위 클라이언트 구독 전부가 이 패턴)가 DELETE 이벤트에 대해
+-- 아예 매치되지 않고 조용히 씹힌다 — "나가기"로 나간 참가자가 다른 사람 화면에서 안
+-- 사라지고, 커스텀 역할을 지워도 다른 화면에 안 지워지는 게 이 문제였다. DELETE가
+-- realtime으로 반영돼야 하는 테이블은 FULL로 바꿔서 지워진 행 전체를 실어 보내게 한다.
+alter table members replica identity full;
+alter table role_preferences replica identity full;
+alter table role_conflicts replica identity full;
+alter table role_conflict_choices replica identity full;
+alter table custom_roles replica identity full;
 
 -- ============================================================
 -- draw_winner: 가중치 기반 뽑기를 원자적으로 처리하는 함수.
@@ -299,3 +339,38 @@ alter publication supabase_realtime add table public.role_conflict_choices;
 -- 컨디션을 막기 위한 락 컬럼. 마이그레이션 3을 이미 실행한 프로젝트는 이 줄만 실행한다.
 -- ============================================================
 alter table rooms add column if not exists advancing boolean not null default false;
+
+-- ============================================================
+-- 마이그레이션 4: 역할 관리(추천/커스텀 역할, 게임별 역할 선택) + 게임 기록.
+-- 기록 자체는 이미 남아있던 role_assignments를 라운드별로 묶어 보여주는 것뿐이라
+-- 새 테이블이 필요 없고, custom_roles 테이블 하나와 rooms.active_roles 컬럼만 추가한다.
+-- ============================================================
+alter table rooms add column if not exists active_roles text[];
+
+create table if not exists custom_roles (
+  id          uuid primary key default gen_random_uuid(),
+  room_id     uuid not null references rooms(id) on delete cascade,
+  name        text not null,
+  description text,
+  created_by  uuid references members(id) on delete set null,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+create index if not exists custom_roles_room_id_idx on custom_roles(room_id);
+alter table custom_roles enable row level security;
+create policy custom_roles_open on custom_roles for all using (true) with check (true);
+alter publication supabase_realtime add table public.custom_roles;
+
+-- ============================================================
+-- 마이그레이션 5: DELETE realtime 필터 버그 수정.
+-- 기본 REPLICA IDENTITY(기본키만)로는 삭제된 행의 room_id가 안 실려서, room_id로 거는
+-- postgres_changes 필터(클라이언트 구독 전부가 이 패턴)가 DELETE에 대해 매치되지 않고
+-- 조용히 씹힌다 — "나가기"로 나간 참가자가 다른 사람 화면에서 안 사라지고, 커스텀
+-- 역할을 지워도 다른 화면엔 안 지워지는 원인이었다(실제로 테스트하다 발견).
+-- ============================================================
+alter table members replica identity full;
+alter table role_preferences replica identity full;
+alter table role_conflicts replica identity full;
+alter table role_conflict_choices replica identity full;
+alter table custom_roles replica identity full;

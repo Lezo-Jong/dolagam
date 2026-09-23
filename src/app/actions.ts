@@ -75,20 +75,94 @@ export async function drawWinner(roomId: string) {
 // "결과가 전부 랜덤이 아니라 선택이 반영된다"는 게 기존 draw_winner와의 차이다.
 // ============================================================
 
-export async function startGame(roomId: string) {
+// activeRoles: 이번 게임에서 실제로 쓸 역할 이름들(추천 + 커스텀 중 체크된 것). 이
+// 스냅샷을 rooms.active_roles에 저장해두면, 나중에 커스텀 역할이 수정/삭제돼도 이미
+// 시작한 게임의 역할 풀은 안 바뀐다.
+export async function startGame(roomId: string, activeRoles: string[]) {
   const supabase = getSupabase();
   const { count } = await supabase
     .from("members")
     .select("*", { count: "exact", head: true })
     .eq("room_id", roomId);
   if ((count ?? 0) < 2) return { ok: false as const, error: "참가자가 2명 이상 필요해요" };
+  if (activeRoles.length < (count ?? 0)) {
+    return { ok: false as const, error: "참가자 수보다 역할이 적어요" };
+  }
 
   const { error } = await supabase
     .from("rooms")
-    .update({ game_phase: "preference", conflict_rank: 0 })
+    .update({ game_phase: "preference", conflict_rank: 0, active_roles: activeRoles })
     .eq("id", roomId)
     .eq("game_phase", "lobby");
   if (error) return { ok: false as const, error: "시작하지 못했어요" };
+  return { ok: true as const };
+}
+
+// ============================================================
+// 커스텀 역할("내 역할") — situations.ts의 고정 역할은 "추천 역할"로 남고, 이건 방마다
+// 자유롭게 추가하는 역할이다. RLS는 완전히 열려 있어서 "만든 사람만 수정/삭제" 권한은
+// 여기(서버 액션)에서 created_by를 대조해 지킨다.
+// ============================================================
+
+export async function addCustomRole(
+  roomId: string,
+  memberId: string,
+  name: string,
+  description: string
+) {
+  const trimmedName = name.trim().slice(0, 20);
+  if (!trimmedName) return { ok: false as const, error: "역할 이름을 입력해주세요" };
+
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("custom_roles")
+    .insert({
+      room_id: roomId,
+      name: trimmedName,
+      description: description.trim().slice(0, 60) || null,
+      created_by: memberId,
+    })
+    .select()
+    .single();
+  if (error) return { ok: false as const, error: "역할을 추가하지 못했어요" };
+  return { ok: true as const, roleId: data.id as string };
+}
+
+export async function updateCustomRole(
+  roleId: string,
+  memberId: string,
+  name: string,
+  description: string
+) {
+  const trimmedName = name.trim().slice(0, 20);
+  if (!trimmedName) return { ok: false as const, error: "역할 이름을 입력해주세요" };
+
+  const supabase = getSupabase();
+  const { data: role } = await supabase.from("custom_roles").select("created_by").eq("id", roleId).maybeSingle();
+  if (!role || role.created_by !== memberId) {
+    return { ok: false as const, error: "이 역할을 수정할 권한이 없어요" };
+  }
+
+  const { error } = await supabase
+    .from("custom_roles")
+    .update({
+      name: trimmedName,
+      description: description.trim().slice(0, 60) || null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", roleId);
+  if (error) return { ok: false as const, error: "역할을 수정하지 못했어요" };
+  return { ok: true as const };
+}
+
+export async function deleteCustomRole(roleId: string, memberId: string) {
+  const supabase = getSupabase();
+  const { data: role } = await supabase.from("custom_roles").select("created_by").eq("id", roleId).maybeSingle();
+  if (!role || role.created_by !== memberId) {
+    return { ok: false as const, error: "이 역할을 삭제할 권한이 없어요" };
+  }
+
+  await supabase.from("custom_roles").delete().eq("id", roleId);
   return { ok: true as const };
 }
 
@@ -225,8 +299,11 @@ async function processNextRankInner(
   if (!room || (room.game_phase !== "preference" && room.game_phase !== "conflict")) return;
 
   const situationInfo = findSituation(room.situation);
-  const roleList = situationInfo?.situation.roles;
-  if (!roleList) return;
+  if (!situationInfo) return;
+  // "게임 시작" 때 고른 역할 스냅샷을 우선 쓰고, 한 번도 안 골라본(예전) 방이면 추천
+  // 역할 전체로 대체한다 — 이 기능이 생기기 전에 만들어진 방도 그대로 동작해야 한다.
+  const roleList: string[] =
+    room.active_roles && room.active_roles.length > 0 ? room.active_roles : situationInfo.situation.roles;
 
   const { data: members } = await supabase.from("members").select("*").eq("room_id", roomId);
   if (!members) return;
@@ -588,13 +665,17 @@ export async function submitRpsMove(conflictId: string, memberId: string, move: 
 
 // "다시 하기" / "다음 주 당번 정하기" — 같은 방·참가자로 새 게임 세션을 시작한다.
 // role_assignments는 지우지 않고 그대로 둔다 — round 번호로 이미 구분되니 다음 라운드
-// 계산에 영향을 주지 않고, 다음 finalize 단계의 "직전 역할 회피"가 이걸 참고한다.
+// 계산에 영향을 주지 않고, 다음 finalize 단계의 "직전 역할 회피"가 이걸 참고하며,
+// "📋 기록" 화면도 이 데이터를 라운드별로 묶어서 보여준다.
 // role_preferences는 round 구분이 없는 "이번 라운드 진행 중" 데이터라 반드시 비워야
 // 다음 라운드에 예전 선택이 섞여 들어가지 않는다.
+// lobby로 되돌리는 건(예전엔 곧장 preference로 갔다) 매 게임마다 이번엔 어떤 역할을
+// 쓸지 다시 고를 기회를 주기 위해서다 — active_roles는 그대로 남겨서 "지난번과 같은
+// 역할"을 기본 선택값으로 보여줄 수 있게 한다.
 export async function restartRound(roomId: string) {
   const supabase = getSupabase();
   await supabase.from("role_conflicts").delete().eq("room_id", roomId);
   await supabase.from("role_preferences").delete().eq("room_id", roomId);
   await supabase.from("members").update({ priority_token_used: false }).eq("room_id", roomId);
-  await supabase.from("rooms").update({ game_phase: "preference", conflict_rank: 0 }).eq("id", roomId);
+  await supabase.from("rooms").update({ game_phase: "lobby", conflict_rank: 0 }).eq("id", roomId);
 }

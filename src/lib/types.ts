@@ -17,6 +17,9 @@ export interface Room {
   conflict_rank: number;
   // 다음 지망으로 넘어가는 중 락(동시성 방지용) — 화면에서는 쓰지 않는다.
   advancing: boolean;
+  // 이번 게임에서 실제로 쓰기로 고른 역할 이름들(추천 역할 + 커스텀 역할 중 체크된 것).
+  // null/빈 배열이면 아직 한 번도 안 골라본 방이라 추천 역할 전체를 기본값으로 쓴다.
+  active_roles: string[] | null;
 }
 
 export interface Member {
@@ -95,4 +98,16 @@ export interface RoleConflictChoice {
   choice: ConflictChoice | null;
   rps_move: RpsMove | null;
   created_at: string;
+}
+
+// 사용자가 방에서 직접 만든 역할("내 역할"). situations.ts의 고정 문자열 목록은
+// "추천 역할"로 남고, 이건 그 위에 얹는 방별 커스텀 역할이다.
+export interface CustomRole {
+  id: string;
+  room_id: string;
+  name: string;
+  description: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
 }

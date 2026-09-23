@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 import { getSupabase } from "@/lib/supabase";
 import { findSituation } from "@/lib/situations";
 import type {
+  CustomRole,
   Draw,
   Member,
   Room,
@@ -36,13 +37,19 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
   const situationInfo = findSituation(room.situation);
 
   if (situationInfo) {
-    const [{ data: preferences }, { data: assignments }, { data: conflicts }, { data: conflictChoices }] =
-      await Promise.all([
-        supabase.from("role_preferences").select("*").eq("room_id", room.id),
-        supabase.from("role_assignments").select("*").eq("room_id", room.id),
-        supabase.from("role_conflicts").select("*").eq("room_id", room.id),
-        supabase.from("role_conflict_choices").select("*").eq("room_id", room.id),
-      ]);
+    const [
+      { data: preferences },
+      { data: assignments },
+      { data: conflicts },
+      { data: conflictChoices },
+      { data: customRoles },
+    ] = await Promise.all([
+      supabase.from("role_preferences").select("*").eq("room_id", room.id),
+      supabase.from("role_assignments").select("*").eq("room_id", room.id),
+      supabase.from("role_conflicts").select("*").eq("room_id", room.id),
+      supabase.from("role_conflict_choices").select("*").eq("room_id", room.id),
+      supabase.from("custom_roles").select("*").eq("room_id", room.id).order("created_at", { ascending: true }),
+    ]);
 
     return (
       <RoleGameView
@@ -52,7 +59,8 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
         initialAssignments={(assignments ?? []) as RoleAssignment[]}
         initialConflicts={(conflicts ?? []) as RoleConflict[]}
         initialConflictChoices={(conflictChoices ?? []) as RoleConflictChoice[]}
-        roles={situationInfo.situation.roles}
+        initialCustomRoles={(customRoles ?? []) as CustomRole[]}
+        recommendedRoles={situationInfo.situation.roles}
         situationLabel={`${situationInfo.category.label} · ${situationInfo.situation.label}`}
         recurring={situationInfo.situation.recurring}
       />
