@@ -7,7 +7,7 @@ import { redirect } from "next/navigation";
 import { getSupabase } from "@/lib/supabase";
 import { generateSlug } from "@/lib/slug";
 import { findSituation, type Situation } from "@/lib/situations";
-import { getDecisionMode, type DecisionMode } from "@/lib/decisionPresets";
+import { findDecisionPreset, getDecisionMode, type DecisionMode } from "@/lib/decisionPresets";
 import { weightOf, type ConflictChoice, type Member, type RpsMove, type SkillSnapshot } from "@/lib/types";
 
 export async function createRoom(formData: FormData) {
@@ -436,6 +436,7 @@ async function processNextRankInner(
         round: workingRound,
         skill_level: snapshot?.skill_level ?? null,
         preference_level: snapshot?.preference_level ?? null,
+        game_type: room.problem_type,
       });
     }
     if (rows.length > 0) await supabase.from("role_assignments").insert(rows);
@@ -477,6 +478,7 @@ async function processNextRankInner(
     round: number;
     skill_level: number | null;
     preference_level: number | null;
+    game_type: string;
   }[] = [];
   const conflictsToCreate: {
     room_id: string;
@@ -503,6 +505,7 @@ async function processNextRankInner(
         round: workingRound,
         skill_level: snapshot?.skill_level ?? null,
         preference_level: snapshot?.preference_level ?? null,
+        game_type: room.problem_type,
       });
     } else {
       // 충돌 카드에 "철수 능력⭐⭐⭐/선호❤️❤️" 식으로 보여줄 후보별 스냅샷 — 판정이
@@ -561,6 +564,7 @@ async function finalizeConflict(
   // 충돌이 생길 때 이미 찍어둔 스냅샷을 그대로 쓴다 — 판정이 끝나는 사이 player_skills가
   // 바뀌어도(다른 탭에서 프로필을 고치는 등) 충돌 카드에 보여준 값과 결과가 어긋나지 않는다.
   const winnerSkill = conflict.candidate_skills?.[winnerId] ?? null;
+  const { data: room } = await supabase.from("rooms").select("problem_type").eq("id", conflict.room_id).maybeSingle();
 
   await supabase.from("role_assignments").insert({
     room_id: conflict.room_id,
@@ -572,6 +576,7 @@ async function finalizeConflict(
     round: conflict.round,
     skill_level: winnerSkill?.skill_level ?? null,
     preference_level: winnerSkill?.preference_level ?? null,
+    game_type: room?.problem_type ?? null,
   });
 
   await supabase
@@ -876,6 +881,56 @@ export async function restartRound(roomId: string) {
   await supabase.from("rooms").update({ game_phase: "lobby", conflict_rank: 0 }).eq("id", roomId);
 }
 
+// 🔀 주제 바꾸기 — "다시 하기"와 별개인 기능이다. 다시 하기는 지금 주제를 유지한 채
+// 새 게임을 시작하고(restartRound, 위 함수, 손 안 댐), 이건 같은 방·참가자를 유지한
+// 채 rooms.problem_type/situation 자체를 바꾼다. 게임이 끝난 뒤(game_phase='result')
+// 에만 허용해서 진행 중인 게임이 중간에 꼬이지 않게 한다. 이 프로젝트엔 원래 "방장"
+// 개념이 없고(RLS도 완전히 열려있고 restartRound도 누구나 호출 가능) 참가자 누구나
+// 다시 하기를 누를 수 있으므로, 여기서도 새 권한 체계를 만들지 않고 똑같이 참가자
+// 누구나 바꿀 수 있게 둔다.
+export async function changeTopic(roomId: string, newProblemType: string, newSituationId: string) {
+  const supabase = getSupabase();
+  const { data: room } = await supabase.from("rooms").select("game_phase").eq("id", roomId).maybeSingle();
+  if (!room) return { ok: false as const, error: "방을 찾을 수 없어요" };
+  if (room.game_phase !== "result") {
+    return { ok: false as const, error: "게임이 끝난 뒤에 주제를 바꿀 수 있어요" };
+  }
+
+  await supabase.from("role_conflicts").delete().eq("room_id", roomId);
+  await supabase.from("role_preferences").delete().eq("room_id", roomId);
+  await supabase.from("role_swap_proposals").delete().eq("room_id", roomId);
+  // 커스텀 역할/후보는 이전 주제에서만 의미가 있던 것들이라 같이 지운다 — 과거 기록
+  // (role_assignments)은 역할 이름을 문자열로 그대로 저장해서 이 삭제와 무관하다.
+  await supabase.from("custom_roles").delete().eq("room_id", roomId);
+  await supabase
+    .from("members")
+    .update({ priority_token_used: false, card_token_used: false })
+    .eq("room_id", roomId);
+
+  // rooms.task는 방 헤더에 그대로 표시되는 제목 문자열이라, 주제가 바뀌면 이것도 같이
+  // 안 바꾸면 화면 제목이 이전 주제로 남는다(실제로 테스트 중 발견된 버그).
+  const newTask =
+    findSituation(newSituationId)?.situation.label ?? findDecisionPreset(newSituationId)?.label ?? newSituationId;
+
+  // active_roles를 비워서(null) 새 주제의 기본 후보 목록을 그대로 쓰게 한다 — round는
+  // 건드리지 않는다: 지난 라운드들은 그대로 기록에 남고, 새 주제로 완료되는 다음
+  // 게임이 자연스럽게 다음 round 번호를 받는다.
+  const { error } = await supabase
+    .from("rooms")
+    .update({
+      problem_type: newProblemType,
+      situation: newSituationId,
+      task: newTask,
+      game_phase: "lobby",
+      conflict_rank: 0,
+      active_roles: null,
+    })
+    .eq("id", roomId)
+    .eq("game_phase", "result");
+  if (error) return { ok: false as const, error: "주제를 바꾸지 못했어요" };
+  return { ok: true as const };
+}
+
 // ============================================================
 // 🍚 뭘 먹을까 / 📋 뭐부터 할까 / 🕐 언제 만날까 — "사람 : 역할 = 1:1"이 아니라
 // "그룹 전체가 하나의 답으로 수렴"(뭘 먹을까/언제 만날까)하거나 "할 일들의 순서를
@@ -955,7 +1010,16 @@ async function startSingleChoiceRound(supabase: ReturnType<typeof getSupabase>, 
   const leaders = [...byItem.entries()].filter(([, list]) => list.length === maxCount);
 
   if (leaders.length === 1) {
-    await finalizeSharedDecision(supabase, roomId, members, prefs, leaders[0][0], "preference", workingRound);
+    await finalizeSharedDecision(
+      supabase,
+      roomId,
+      members,
+      prefs,
+      leaders[0][0],
+      "preference",
+      workingRound,
+      room.problem_type
+    );
     return;
   }
 
@@ -987,7 +1051,8 @@ async function finalizeSharedDecision(
   prefs: { member_id: string; role_label: string; rank: number }[],
   item: string,
   reason: "preference" | "priority" | "card" | "duel" | "draw",
-  workingRound: number
+  workingRound: number,
+  gameType: string
 ): Promise<void> {
   const rows = members.map((m) => {
     const mine = prefs.find((p) => p.member_id === m.id && p.role_label === item);
@@ -999,6 +1064,7 @@ async function finalizeSharedDecision(
       assigned_rank: mine?.rank ?? null,
       resolved_by: reason,
       round: workingRound,
+      game_type: gameType,
     };
   });
   await supabase.from("role_assignments").insert(rows);
@@ -1055,6 +1121,7 @@ async function processNextPositionInner(supabase: ReturnType<typeof getSupabase>
       assigned_rank: nextPosition + i,
       resolved_by: "draw" as const,
       round: workingRound,
+      game_type: room.problem_type,
     }));
     await supabase.from("role_assignments").insert(rows);
     await supabase
@@ -1086,6 +1153,7 @@ async function processNextPositionInner(supabase: ReturnType<typeof getSupabase>
       assigned_rank: nextPosition + i,
       resolved_by: "draw" as const,
       round: workingRound,
+      game_type: room.problem_type,
     }));
     await supabase.from("role_assignments").insert(rows);
     await supabase
@@ -1107,6 +1175,7 @@ async function processNextPositionInner(supabase: ReturnType<typeof getSupabase>
       assigned_rank: nextPosition,
       resolved_by: "preference",
       round: workingRound,
+      game_type: room.problem_type,
     });
     return processNextPositionInner(supabase, roomId);
   }
@@ -1213,8 +1282,9 @@ async function finalizeDecisionWinner(
   reason: "priority" | "card" | "duel" | "draw",
   mode: DecisionMode
 ): Promise<void> {
+  const { data: room } = await supabase.from("rooms").select("*").eq("id", conflict.room_id).maybeSingle();
   const { data: prefs } = await supabase.from("role_preferences").select("*").eq("room_id", conflict.room_id);
-  if (!prefs) return;
+  if (!room || !prefs) return;
 
   if (mode === "single-choice") {
     const { data: members } = await supabase.from("members").select("*").eq("room_id", conflict.room_id);
@@ -1227,18 +1297,16 @@ async function finalizeDecisionWinner(
       .from("role_conflicts")
       .update({ status: "resolved", winner_id: winnerId, winner_reason: reason })
       .eq("id", conflict.id);
-    await finalizeSharedDecision(supabase, conflict.room_id, members, prefs, item, reason, conflict.round);
+    await finalizeSharedDecision(supabase, conflict.room_id, members, prefs, item, reason, conflict.round, room.problem_type);
     return;
   }
 
   // ordering: 이긴 대표가 "지금 시점에" 남은 항목 중 가장 원했던 항목을 이번 포지션에 채운다.
-  const { data: room } = await supabase.from("rooms").select("*").eq("id", conflict.room_id).maybeSingle();
   const { data: placed } = await supabase
     .from("role_assignments")
     .select("role_label")
     .eq("room_id", conflict.room_id)
     .eq("round", conflict.round);
-  if (!room) return;
   const placedItems = new Set((placed ?? []).map((p) => p.role_label));
   const remaining = (room.active_roles ?? []).filter((item: string) => !placedItems.has(item));
   const item = effectiveItemForMember(winnerId, prefs, remaining);
@@ -1256,6 +1324,7 @@ async function finalizeDecisionWinner(
     assigned_rank: conflict.rank,
     resolved_by: reason,
     round: conflict.round,
+    game_type: room.problem_type,
   });
   await processNextPosition(supabase, conflict.room_id);
 }

@@ -94,7 +94,11 @@ create table role_assignments (
   -- 복사해 둔다(스냅샷) — 나중에 player_skills를 고쳐도 이 기록은 안 바뀐다. 연결된
   -- 능력이 없는 역할이면 둘 다 null.
   skill_level      int,
-  preference_level int
+  preference_level int,
+  -- 이 라운드가 어떤 주제(rooms.problem_type)로 진행됐는지 스냅샷. 방은 "🔀 주제
+  -- 바꾸기"로 나중에 problem_type이 바뀔 수 있어서, rooms.problem_type을 그때그때
+  -- 조회하면 지난 기록이 지금 주제로 잘못 보인다 — 기록 화면(📋)은 항상 이 값을 쓴다.
+  game_type        text
 );
 
 -- 같은 지망 단계에서 역할 하나에 2명 이상 몰리면 생기는 "충돌" 하나. candidate_ids는
@@ -480,3 +484,11 @@ alter table role_swap_proposals enable row level security;
 create policy role_swap_proposals_open on role_swap_proposals for all using (true) with check (true);
 alter publication supabase_realtime add table public.role_swap_proposals;
 alter table role_swap_proposals replica identity full;
+
+-- ============================================================
+-- 마이그레이션 8: 🔀 주제 바꾸기 — 같은 방·참가자를 유지한 채 rooms.problem_type/
+-- situation만 바꿔서 새 게임 주제로 넘어간다("다시 하기"와 달리 주제 자체가 바뀐다).
+-- role_assignments.game_type은 그 라운드가 어떤 주제였는지 기록해서, 주제를 여러 번
+-- 바꾼 방의 📋 기록 화면이 지난 라운드를 지금 주제가 아니라 그때 주제로 보여주게 한다.
+-- ============================================================
+alter table role_assignments add column if not exists game_type text;

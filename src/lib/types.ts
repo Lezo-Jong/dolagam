@@ -80,6 +80,10 @@ export interface RoleAssignment {
   // 원칙대로, 이 값은 표시 전용이고 배정 로직에는 관여하지 않는다.
   skill_level: number | null;
   preference_level: number | null;
+  // 이 라운드가 어떤 주제(rooms.problem_type)로 진행됐는지 스냅샷 — "🔀 주제 바꾸기"로
+  // 나중에 방의 주제가 바뀌어도 지난 기록은 그때 주제 그대로 보여야 하기 때문. 이
+  // 기능 이전에 만들어진 기록은 null일 수 있다(그럴 땐 지금 방의 주제로 대체 표시).
+  game_type: string | null;
 }
 
 export type ConflictChoice = "priority" | "concede" | "duel" | "card";

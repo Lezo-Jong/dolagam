@@ -61,6 +61,10 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
 
     return (
       <RoleGameView
+        // 🔀 주제 바꾸기로 room.situation이 바뀌면 key가 달라져 컴포넌트가 완전히
+        // 새로 마운트된다 — situation별로 다른 recommendedRoles/skillCategories 같은
+        // "마운트 시점에만 초기화되는" 값들이 새 주제 기준으로 다시 계산되게 하기 위해서다.
+        key={room.situation ?? "role"}
         initialRoom={room as Room}
         initialMembers={(members ?? []) as Member[]}
         initialPreferences={(preferences ?? []) as RolePreference[]}
@@ -100,6 +104,7 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
 
     return (
       <DecisionGameView
+        key={room.situation ?? "decision"}
         initialRoom={room as Room}
         initialMembers={(members ?? []) as Member[]}
         initialPreferences={(preferences ?? []) as RolePreference[]}

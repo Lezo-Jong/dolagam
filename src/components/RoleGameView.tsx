@@ -4,7 +4,7 @@
 // 데이터 흐름은 기존 RoomView와 같은 원칙: 초기값은 서버 컴포넌트가 props로 주고,
 // 이후 변경은 Supabase Realtime 구독으로만 반영한다 — 내가 한 액션도 서버 왕복 후
 // 이 채널로 돌아오므로 성공 시 로컬 state를 직접 조작할 필요가 없다.
-import { useEffect, useState, useSyncExternalStore, useTransition } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -25,6 +25,7 @@ import {
   submitRpsMove,
   updateCustomRole,
 } from "@/app/actions";
+import { problemTypeLabel, summarizeRound } from "@/lib/gameHistory";
 import { clearMyMemberId, getMyMemberId, setMyMemberId } from "@/lib/identity";
 import { getSupabase } from "@/lib/supabase";
 import type {
@@ -40,6 +41,7 @@ import type {
   RoleSwapProposal,
   RpsMove,
 } from "@/lib/types";
+import { TopicSwitcher } from "@/components/TopicSwitcher";
 
 export function RoleGameView({
   initialRoom,
@@ -151,6 +153,17 @@ export function RoleGameView({
   const [dismissedRound, setDismissedRound] = useState<number | null>(null);
   const viewingResult = dismissedRound !== room.round;
 
+  // 🔀 주제 바꾸기 화면을 보여줄지. 결과 화면 안에서만 노출된다.
+  const [showTopicSwitcher, setShowTopicSwitcher] = useState(false);
+
+  // Realtime으로 들어온 room 갱신에서 problem_type/situation이 바뀌었는지 보려면
+  // "지금까지의 room" 값이 필요한데, 구독 이펙트는 room.id에만 의존해서(재구독 방지)
+  // 클로저 안의 room이 stale하다 — ref로 최신 값을 따로 들고 있는다.
+  const roomRef = useRef(room);
+  useEffect(() => {
+    roomRef.current = room;
+  }, [room]);
+
   useEffect(() => {
     const channel = supabase
       .channel(`role-game-${room.id}`)
@@ -159,7 +172,18 @@ export function RoleGameView({
         { event: "*", schema: "public", table: "rooms", filter: `id=eq.${room.id}` },
         (payload) => {
           if (payload.eventType === "DELETE") return;
-          setRoom(payload.new as Room);
+          const next = payload.new as Room;
+          // 🔀 주제 바꾸기로 problem_type/situation이 바뀌면 이 컴포넌트 자체가 더 이상
+          // 맞는 화면이 아닐 수 있다(DecisionGameView로 바뀌어야 할 수도 있음) —
+          // page.tsx(서버 컴포넌트)가 새 주제에 맞는 화면을 다시 골라 그리도록 새로고침한다.
+          if (
+            next.problem_type !== roomRef.current.problem_type ||
+            next.situation !== roomRef.current.situation
+          ) {
+            router.refresh();
+            return;
+          }
+          setRoom(next);
         }
       )
       .on(
@@ -991,27 +1015,41 @@ export function RoleGameView({
             <p className="text-center text-sm text-zinc-500">방 대기 화면이에요.</p>
           )}
 
-          <div className="flex flex-col gap-2">
-            <button
-              onClick={handleRestart}
-              disabled={restarting}
-              className="h-12 w-full rounded-xl bg-zinc-900 text-base font-bold text-white transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-300"
-            >
-              {restarting ? "준비하는 중..." : recurring ? "🔄 다음 주 당번 정하기" : "🔄 다시 하기"}
-            </button>
-            <button
-              onClick={() => setDismissedRound(viewingResult ? room.round : null)}
-              className="h-11 w-full rounded-xl border border-zinc-300 text-sm font-semibold text-zinc-700 transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-zinc-50"
-            >
-              {viewingResult ? "🏠 방으로 돌아가기" : "결과 다시 보기"}
-            </button>
-            <button
-              onClick={handleLeave}
-              className="h-11 w-full rounded-xl text-sm font-medium text-zinc-400 transition-colors hover:text-red-500"
-            >
-              🚪 나가기
-            </button>
-          </div>
+          {showTopicSwitcher ? (
+            <TopicSwitcher
+              roomId={room.id}
+              currentProblemType={room.problem_type}
+              onCancel={() => setShowTopicSwitcher(false)}
+            />
+          ) : (
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={handleRestart}
+                disabled={restarting}
+                className="h-12 w-full rounded-xl bg-zinc-900 text-base font-bold text-white transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-300"
+              >
+                {restarting ? "준비하는 중..." : recurring ? "🔄 다음 주 당번 정하기" : "🔄 다시 하기"}
+              </button>
+              <button
+                onClick={() => setShowTopicSwitcher(true)}
+                className="h-11 w-full rounded-xl border border-zinc-300 text-sm font-semibold text-zinc-700 transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-zinc-50"
+              >
+                🔀 주제 바꾸기
+              </button>
+              <button
+                onClick={() => setDismissedRound(viewingResult ? room.round : null)}
+                className="h-11 w-full rounded-xl border border-zinc-300 text-sm font-semibold text-zinc-700 transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-zinc-50"
+              >
+                {viewingResult ? "🏠 방으로 돌아가기" : "결과 다시 보기"}
+              </button>
+              <button
+                onClick={handleLeave}
+                className="h-11 w-full rounded-xl text-sm font-medium text-zinc-400 transition-colors hover:text-red-500"
+              >
+                🚪 나가기
+              </button>
+            </div>
+          )}
         </section>
       )}
         </>
@@ -1053,6 +1091,7 @@ function HistorySection({
     const sessionAssignments = byRound.get(historyRound)!;
     const usedRoles = [...new Set(sessionAssignments.map((a) => a.role_label))];
     const date = formatSessionDate(sessionAssignments[0].created_at);
+    const topicLabel = problemTypeLabel(sessionAssignments[0].game_type, situationLabel);
     return (
       <section className="flex flex-col gap-3">
         <button
@@ -1063,10 +1102,10 @@ function HistorySection({
         </button>
         <div>
           <h2 className="text-lg font-bold text-zinc-900 dark:text-zinc-50">📋 {date}</h2>
-          <p className="text-sm text-zinc-400">{situationLabel}</p>
+          <p className="text-sm text-zinc-400">{topicLabel}</p>
         </div>
         <div className="rounded-xl border border-zinc-200 bg-white p-3 text-sm dark:border-zinc-800 dark:bg-zinc-900">
-          <span className="text-xs font-semibold text-zinc-400">사용한 역할</span>
+          <span className="text-xs font-semibold text-zinc-400">사용한 후보</span>
           <p className="mt-1 text-zinc-700 dark:text-zinc-300">{usedRoles.join(" · ")}</p>
         </div>
         <div className="flex flex-col gap-2">
@@ -1077,7 +1116,7 @@ function HistorySection({
             >
               <div>
                 <span className="font-medium text-zinc-900 dark:text-zinc-50">
-                  {a.member_name} → {a.role_label}
+                  {a.member_id ? `${a.member_name} → ${a.role_label}` : a.role_label}
                 </span>
                 {a.skill_level != null && (
                   <p className="text-xs text-zinc-400">
@@ -1099,6 +1138,8 @@ function HistorySection({
       {rounds.map((round) => {
         const sessionAssignments = byRound.get(round)!;
         const date = formatSessionDate(sessionAssignments[0].created_at);
+        const topicLabel = problemTypeLabel(sessionAssignments[0].game_type, situationLabel);
+        const summary = summarizeRound(sessionAssignments);
         return (
           <button
             key={round}
@@ -1106,13 +1147,12 @@ function HistorySection({
             className="flex flex-col gap-1.5 rounded-2xl border border-zinc-200 bg-white p-4 text-left transition-colors hover:border-zinc-900 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-zinc-50"
           >
             <span className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">{date}</span>
-            <span className="text-xs text-zinc-400">{situationLabel}</span>
+            <span className="text-xs text-zinc-400">{topicLabel}</span>
             <div className="mt-1 flex flex-col gap-0.5 text-sm text-zinc-600 dark:text-zinc-400">
-              {sessionAssignments.map((a) => (
-                <span key={a.id}>
-                  {a.member_name} → {a.role_label}
-                </span>
-              ))}
+              {summary.kind === "per-member" &&
+                summary.lines.map((line) => <span key={line}>{line}</span>)}
+              {summary.kind === "shared" && <span>결과: {summary.result}</span>}
+              {summary.kind === "ordered" && <span>{summary.items.join(" → ")}</span>}
             </div>
           </button>
         );

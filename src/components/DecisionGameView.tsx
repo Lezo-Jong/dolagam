@@ -5,7 +5,7 @@
 // "할 일들의 순서"(ordering)라서 결과/충돌 카드 표현만 다르게 렌더링한다. 선택/충돌
 // 해결 자체(1~3지망 선택, 우선권/양보/승부/카드, 가위바위보)는 actions.ts의 같은
 // 함수(submitPreference/submitConflictChoice/submitRpsMove)를 그대로 쓴다.
-import { useEffect, useState, useSyncExternalStore, useTransition } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -21,6 +21,7 @@ import {
   submitRpsMove,
 } from "@/app/actions";
 import type { DecisionMode } from "@/lib/decisionPresets";
+import { problemTypeLabel, summarizeRound } from "@/lib/gameHistory";
 import { clearMyMemberId, getMyMemberId, setMyMemberId } from "@/lib/identity";
 import { getSupabase } from "@/lib/supabase";
 import type {
@@ -34,6 +35,7 @@ import type {
   RolePreference,
   RpsMove,
 } from "@/lib/types";
+import { TopicSwitcher } from "@/components/TopicSwitcher";
 
 export function DecisionGameView({
   initialRoom,
@@ -125,6 +127,13 @@ export function DecisionGameView({
   const [dismissedRound, setDismissedRound] = useState<number | null>(null);
   const viewingResult = dismissedRound !== room.round;
 
+  const [showTopicSwitcher, setShowTopicSwitcher] = useState(false);
+
+  const roomRef = useRef(room);
+  useEffect(() => {
+    roomRef.current = room;
+  }, [room]);
+
   useEffect(() => {
     const channel = supabase
       .channel(`decision-game-${room.id}`)
@@ -133,7 +142,17 @@ export function DecisionGameView({
         { event: "*", schema: "public", table: "rooms", filter: `id=eq.${room.id}` },
         (payload) => {
           if (payload.eventType === "DELETE") return;
-          setRoom(payload.new as Room);
+          const next = payload.new as Room;
+          // 🔀 주제 바꾸기로 problem_type/situation이 바뀌면 page.tsx가 다시 실행돼야
+          // 맞는 화면(RoleGameView일 수도 있음)이 그려진다 — 새로고침으로 위임한다.
+          if (
+            next.problem_type !== roomRef.current.problem_type ||
+            next.situation !== roomRef.current.situation
+          ) {
+            router.refresh();
+            return;
+          }
+          setRoom(next);
         }
       )
       .on(
@@ -403,7 +422,7 @@ export function DecisionGameView({
       </header>
 
       {view === "history" ? (
-        <DecisionHistorySection assignments={assignments} mode={mode} situationLabel={situationLabel} />
+        <DecisionHistorySection assignments={assignments} situationLabel={situationLabel} />
       ) : (
         <>
           <section className="flex flex-col gap-2 rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
@@ -699,6 +718,13 @@ export function DecisionGameView({
                 <p className="text-center text-sm text-zinc-500">방 대기 화면이에요.</p>
               )}
 
+              {showTopicSwitcher ? (
+                <TopicSwitcher
+                  roomId={room.id}
+                  currentProblemType={room.problem_type}
+                  onCancel={() => setShowTopicSwitcher(false)}
+                />
+              ) : (
               <div className="flex flex-col gap-2">
                 <button
                   onClick={handleRestart}
@@ -706,6 +732,12 @@ export function DecisionGameView({
                   className="h-12 w-full rounded-xl bg-zinc-900 text-base font-bold text-white transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-300"
                 >
                   {restarting ? "준비하는 중..." : "🔄 다시 하기"}
+                </button>
+                <button
+                  onClick={() => setShowTopicSwitcher(true)}
+                  className="h-11 w-full rounded-xl border border-zinc-300 text-sm font-semibold text-zinc-700 transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-zinc-50"
+                >
+                  🔀 주제 바꾸기
                 </button>
                 <button
                   onClick={() => setDismissedRound(viewingResult ? room.round : null)}
@@ -720,6 +752,7 @@ export function DecisionGameView({
                   🚪 나가기
                 </button>
               </div>
+              )}
             </section>
           )}
         </>
@@ -744,11 +777,9 @@ function rankBadge(assignedRank: number | null): string {
 
 function DecisionHistorySection({
   assignments,
-  mode,
   situationLabel,
 }: {
   assignments: RoleAssignment[];
-  mode: DecisionMode;
   situationLabel: string;
 }) {
   const byRound = new Map<number, RoleAssignment[]>();
@@ -776,18 +807,20 @@ function DecisionHistorySection({
           month: "long",
           day: "numeric",
         });
-        const summary =
-          mode === "single-choice"
-            ? rows[0]?.role_label ?? "-"
-            : rows.map((r) => r.role_label).join(" → ");
+        const summary = summarizeRound(rows);
+        const topicLabel = problemTypeLabel(rows[0]?.game_type, situationLabel);
         return (
           <div
             key={round}
             className="flex flex-col gap-1 rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
           >
             <span className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">{date}</span>
-            <span className="text-xs text-zinc-400">{situationLabel}</span>
-            <span className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">결과: {summary}</span>
+            <span className="text-xs text-zinc-400">{topicLabel}</span>
+            <span className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+              {summary.kind === "shared" && `결과: ${summary.result}`}
+              {summary.kind === "ordered" && summary.items.join(" → ")}
+              {summary.kind === "per-member" && summary.lines.join(", ")}
+            </span>
           </div>
         );
       })}

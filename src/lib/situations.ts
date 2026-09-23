@@ -132,7 +132,7 @@ export const SITUATION_CATEGORIES: SituationCategory[] = [
 // 않고 이 Situation 카탈로그에 하나만 더 얹는다. 다만 대학/직장/집 상황 목록(사람이
 // "역할 정하기"를 고를 때 고르는 목록)에는 안 섞이게 SITUATION_CATEGORIES엔 안 넣고
 // findSituation에서만 별도로 찾는다.
-const SHOPPING_SITUATION: { category: SituationCategory; situation: Situation } = {
+export const SHOPPING_SITUATION: { category: SituationCategory; situation: Situation } = {
   category: { id: "shopping", label: "쇼핑", emoji: "🛍️", situations: [] },
   situation: {
     id: "shopping-default",
