@@ -6,8 +6,8 @@
 import { redirect } from "next/navigation";
 import { getSupabase } from "@/lib/supabase";
 import { generateSlug } from "@/lib/slug";
-import { findSituation } from "@/lib/situations";
-import { weightOf, type Member } from "@/lib/types";
+import { findSituation, type Situation } from "@/lib/situations";
+import { weightOf, type Member, type SkillSnapshot } from "@/lib/types";
 
 export async function createRoom(formData: FormData) {
   const task = String(formData.get("task") ?? "").trim().slice(0, 30);
@@ -104,11 +104,14 @@ export async function startGame(roomId: string, activeRoles: string[]) {
 // 여기(서버 액션)에서 created_by를 대조해 지킨다.
 // ============================================================
 
+// skillCategory: 이 역할과 연결할 능력(situations.ts situation.skills 중 하나). 필수
+// 아님 — null이면 이 역할엔 능력/선호 표시가 안 붙는다(스펙 11번).
 export async function addCustomRole(
   roomId: string,
   memberId: string,
   name: string,
-  description: string
+  description: string,
+  skillCategory: string | null
 ) {
   const trimmedName = name.trim().slice(0, 20);
   if (!trimmedName) return { ok: false as const, error: "역할 이름을 입력해주세요" };
@@ -121,6 +124,7 @@ export async function addCustomRole(
       name: trimmedName,
       description: description.trim().slice(0, 60) || null,
       created_by: memberId,
+      skill_category: skillCategory,
     })
     .select()
     .single();
@@ -132,7 +136,8 @@ export async function updateCustomRole(
   roleId: string,
   memberId: string,
   name: string,
-  description: string
+  description: string,
+  skillCategory: string | null
 ) {
   const trimmedName = name.trim().slice(0, 20);
   if (!trimmedName) return { ok: false as const, error: "역할 이름을 입력해주세요" };
@@ -148,6 +153,7 @@ export async function updateCustomRole(
     .update({
       name: trimmedName,
       description: description.trim().slice(0, 60) || null,
+      skill_category: skillCategory,
       updated_at: new Date().toISOString(),
     })
     .eq("id", roleId);
@@ -164,6 +170,79 @@ export async function deleteCustomRole(roleId: string, memberId: string) {
 
   await supabase.from("custom_roles").delete().eq("id", roleId);
   return { ok: true as const };
+}
+
+// ============================================================
+// 플레이어 능력/선호 — "지금의 프로필"이라 게임 도중에도 자유롭게 고칠 수 있다. 이
+// 값은 결과를 자동으로 정하지 않고, 충돌 카드/결과 화면에 참고 정보로만 쓰인다(스펙
+// 6번). level은 0(미설정)~3.
+// ============================================================
+
+export async function setSkillLevel(roomId: string, memberId: string, skillCategory: string, level: number) {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from("player_skills")
+    .upsert(
+      { room_id: roomId, member_id: memberId, skill_category: skillCategory, skill_level: level },
+      { onConflict: "room_id,member_id,skill_category" }
+    );
+  if (error) return { ok: false as const, error: "능력을 저장하지 못했어요" };
+  return { ok: true as const };
+}
+
+export async function setPreferenceLevel(
+  roomId: string,
+  memberId: string,
+  skillCategory: string,
+  level: number
+) {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from("player_skills")
+    .upsert(
+      { room_id: roomId, member_id: memberId, skill_category: skillCategory, preference_level: level },
+      { onConflict: "room_id,member_id,skill_category" }
+    );
+  if (error) return { ok: false as const, error: "선호를 저장하지 못했어요" };
+  return { ok: true as const };
+}
+
+// 역할 이름 -> 관련 능력 카테고리. 추천 역할은 situations.ts에, 커스텀 역할은
+// custom_roles.skill_category에 있다. 연결된 능력이 없으면 null(그 역할은 능력/선호를
+// 표시하지 않는다).
+async function getRoleSkillCategory(
+  supabase: ReturnType<typeof getSupabase>,
+  roomId: string,
+  situation: Situation,
+  roleLabel: string
+): Promise<string | null> {
+  const fromSituation = situation.roleSkills[roleLabel];
+  if (fromSituation) return fromSituation;
+
+  const { data } = await supabase
+    .from("custom_roles")
+    .select("skill_category")
+    .eq("room_id", roomId)
+    .eq("name", roleLabel)
+    .maybeSingle();
+  return data?.skill_category ?? null;
+}
+
+async function getSkillSnapshot(
+  supabase: ReturnType<typeof getSupabase>,
+  roomId: string,
+  memberId: string,
+  skillCategory: string | null
+): Promise<SkillSnapshot | null> {
+  if (!skillCategory) return null;
+  const { data } = await supabase
+    .from("player_skills")
+    .select("skill_level, preference_level")
+    .eq("room_id", roomId)
+    .eq("member_id", memberId)
+    .eq("skill_category", skillCategory)
+    .maybeSingle();
+  return { skill_level: data?.skill_level ?? 0, preference_level: data?.preference_level ?? 0 };
 }
 
 // rank: 1~3지망. roleLabel이 null/빈 문자열이면 그 지망 선택을 지운다(반드시 3개를
@@ -342,15 +421,22 @@ async function processNextRankInner(
     }
 
     const pairs = assignLeftoversAvoidingRepeat(unassigned, remainingRoles, previousRoleByMember);
-    const rows = pairs.map(({ member, role }) => ({
-      room_id: roomId,
-      role_label: role,
-      member_id: member.id,
-      member_name: member.name,
-      assigned_rank: null,
-      resolved_by: "draw" as const,
-      round: workingRound,
-    }));
+    const rows = [];
+    for (const { member, role } of pairs) {
+      const skillCategory = await getRoleSkillCategory(supabase, roomId, situationInfo.situation, role);
+      const snapshot = await getSkillSnapshot(supabase, roomId, member.id, skillCategory);
+      rows.push({
+        room_id: roomId,
+        role_label: role,
+        member_id: member.id,
+        member_name: member.name,
+        assigned_rank: null,
+        resolved_by: "draw" as const,
+        round: workingRound,
+        skill_level: snapshot?.skill_level ?? null,
+        preference_level: snapshot?.preference_level ?? null,
+      });
+    }
     if (rows.length > 0) await supabase.from("role_assignments").insert(rows);
 
     const drawnIds = rows.map((r) => r.member_id);
@@ -388,6 +474,8 @@ async function processNextRankInner(
     assigned_rank: number;
     resolved_by: "preference";
     round: number;
+    skill_level: number | null;
+    preference_level: number | null;
   }[] = [];
   const conflictsToCreate: {
     room_id: string;
@@ -396,10 +484,14 @@ async function processNextRankInner(
     role_label: string;
     candidate_ids: string[];
     status: "choosing";
+    candidate_skills: Record<string, SkillSnapshot> | null;
   }[] = [];
 
   for (const [role, candidates] of byRole) {
+    const skillCategory = await getRoleSkillCategory(supabase, roomId, situationInfo.situation, role);
+
     if (candidates.length === 1) {
+      const snapshot = await getSkillSnapshot(supabase, roomId, candidates[0].id, skillCategory);
       singleRows.push({
         room_id: roomId,
         role_label: role,
@@ -408,8 +500,20 @@ async function processNextRankInner(
         assigned_rank: nextRank,
         resolved_by: "preference",
         round: workingRound,
+        skill_level: snapshot?.skill_level ?? null,
+        preference_level: snapshot?.preference_level ?? null,
       });
     } else {
+      // 충돌 카드에 "철수 능력⭐⭐⭐/선호❤️❤️" 식으로 보여줄 후보별 스냅샷 — 판정이
+      // 끝날 때까지(그리고 기록에서도) 이 값 그대로 쓴다.
+      let candidateSkills: Record<string, SkillSnapshot> | null = null;
+      if (skillCategory) {
+        candidateSkills = {};
+        for (const candidate of candidates) {
+          const snapshot = await getSkillSnapshot(supabase, roomId, candidate.id, skillCategory);
+          if (snapshot) candidateSkills[candidate.id] = snapshot;
+        }
+      }
       conflictsToCreate.push({
         room_id: roomId,
         round: workingRound,
@@ -417,6 +521,7 @@ async function processNextRankInner(
         role_label: role,
         candidate_ids: candidates.map((c) => c.id),
         status: "choosing",
+        candidate_skills: candidateSkills,
       });
     }
   }
@@ -438,12 +543,23 @@ async function processNextRankInner(
 
 async function finalizeConflict(
   supabase: ReturnType<typeof getSupabase>,
-  conflict: { id: string; room_id: string; role_label: string; rank: number; round: number },
+  conflict: {
+    id: string;
+    room_id: string;
+    role_label: string;
+    rank: number;
+    round: number;
+    candidate_skills: Record<string, SkillSnapshot> | null;
+  },
   winnerId: string,
   reason: "priority" | "duel" | "draw"
 ): Promise<void> {
   const { data: winner } = await supabase.from("members").select("*").eq("id", winnerId).maybeSingle();
   if (!winner) return;
+
+  // 충돌이 생길 때 이미 찍어둔 스냅샷을 그대로 쓴다 — 판정이 끝나는 사이 player_skills가
+  // 바뀌어도(다른 탭에서 프로필을 고치는 등) 충돌 카드에 보여준 값과 결과가 어긋나지 않는다.
+  const winnerSkill = conflict.candidate_skills?.[winnerId] ?? null;
 
   await supabase.from("role_assignments").insert({
     room_id: conflict.room_id,
@@ -453,6 +569,8 @@ async function finalizeConflict(
     assigned_rank: conflict.rank,
     resolved_by: reason,
     round: conflict.round,
+    skill_level: winnerSkill?.skill_level ?? null,
+    preference_level: winnerSkill?.preference_level ?? null,
   });
 
   await supabase

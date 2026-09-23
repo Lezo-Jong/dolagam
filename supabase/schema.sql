@@ -78,32 +78,41 @@ create table role_preferences (
 -- resolved_by로 "충돌 없이 그대로 배정됐는지 / 충돌해서 뽑기로 정해졌는지"를 구분해
 -- 화면에 표시한다 — 결과가 전부 랜덤이 아니라는 걸 보여주는 지점.
 create table role_assignments (
-  id            uuid primary key default gen_random_uuid(),
-  room_id       uuid not null references rooms(id) on delete cascade,
-  role_label    text not null,
-  member_id     uuid references members(id) on delete set null,
-  member_name   text not null,
-  assigned_rank int,
-  resolved_by   text not null default 'preference',
-  round         int not null,
-  created_at    timestamptz not null default now()
+  id               uuid primary key default gen_random_uuid(),
+  room_id          uuid not null references rooms(id) on delete cascade,
+  role_label       text not null,
+  member_id        uuid references members(id) on delete set null,
+  member_name      text not null,
+  assigned_rank    int,
+  resolved_by      text not null default 'preference',
+  round            int not null,
+  created_at       timestamptz not null default now(),
+  -- 이 역할에 연결된 능력이 있으면, 배정된 사람의 그 능력/선호 값을 배정 시점에 그대로
+  -- 복사해 둔다(스냅샷) — 나중에 player_skills를 고쳐도 이 기록은 안 바뀐다. 연결된
+  -- 능력이 없는 역할이면 둘 다 null.
+  skill_level      int,
+  preference_level int
 );
 
 -- 같은 지망 단계에서 역할 하나에 2명 이상 몰리면 생기는 "충돌" 하나. candidate_ids는
 -- 그 역할을 이 지망으로 고른 사람 전원, finalist_ids는 우선권/양보/승부 1단계를 거쳐
 -- 가위바위보까지 가야 하는 사람만 남긴 좁혀진 목록(2단계 전엔 null).
 create table role_conflicts (
-  id            uuid primary key default gen_random_uuid(),
-  room_id       uuid not null references rooms(id) on delete cascade,
-  round         int not null,
-  rank          int not null,
-  role_label    text not null,
-  candidate_ids uuid[] not null,
-  finalist_ids  uuid[],
-  status        text not null default 'choosing', -- 'choosing' | 'rps' | 'resolved'
-  winner_id     uuid references members(id) on delete set null,
-  winner_reason text, -- 'priority' | 'duel' | 'draw'
-  created_at    timestamptz not null default now()
+  id               uuid primary key default gen_random_uuid(),
+  room_id          uuid not null references rooms(id) on delete cascade,
+  round            int not null,
+  rank             int not null,
+  role_label       text not null,
+  candidate_ids    uuid[] not null,
+  finalist_ids     uuid[],
+  status           text not null default 'choosing', -- 'choosing' | 'rps' | 'resolved'
+  winner_id        uuid references members(id) on delete set null,
+  winner_reason    text, -- 'priority' | 'duel' | 'draw'
+  created_at       timestamptz not null default now(),
+  -- 충돌이 생기는 시점의 후보별 능력/선호 스냅샷: {"<member_id>": {"skill_level": n,
+  -- "preference_level": n}, ...}. 충돌 카드에 "철수 능력⭐⭐⭐/선호❤️❤️" 식으로
+  -- 보여주는 정보이자, 이후 player_skills가 바뀌어도 이 충돌엔 영향 없게 하는 스냅샷.
+  candidate_skills jsonb
 );
 
 -- 충돌 참가자 각자의 선택. choice는 1단계(우선권/양보/승부), rps_move는 2단계(가위바위보)
@@ -133,13 +142,33 @@ create table role_conflict_choices (
 -- 과거 게임 결과(role_assignments)는 role_label을 문자열로 그대로 저장하지 이 테이블을
 -- 참조하지 않으므로, 커스텀 역할을 나중에 지워도 지난 기록의 역할 이름은 안 깨진다.
 create table custom_roles (
-  id          uuid primary key default gen_random_uuid(),
-  room_id     uuid not null references rooms(id) on delete cascade,
-  name        text not null,
-  description text,
-  created_by  uuid references members(id) on delete set null,
-  created_at  timestamptz not null default now(),
-  updated_at  timestamptz not null default now()
+  id             uuid primary key default gen_random_uuid(),
+  room_id        uuid not null references rooms(id) on delete cascade,
+  name           text not null,
+  description    text,
+  created_by     uuid references members(id) on delete set null,
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now(),
+  -- 이 역할과 연결된 능력 카테고리(situations.ts의 skills 중 하나, 또는 null=연결 안 함).
+  skill_category text
+);
+
+-- 플레이어가 스스로 매기는 능력/선호. situations.ts의 상황마다 다른 능력 카테고리를
+-- 쓰고(예: 팀플="발표", 집안일="설거지"), 레벨은 0(미설정)~3의 단순한 3단계다.
+-- 이건 "지금 이 사람의 프로필"이라 게임 중에도 자유롭게 고칠 수 있는 값이고, 이미
+-- 끝난 게임 기록은 이 값을 실시간으로 참조하지 않는다 — 충돌/결과가 만들어지는 순간의
+-- 값을 role_conflicts.candidate_skills / role_assignments.skill_level 등에 그대로
+-- 복사해 두기 때문에(스펙 10번 "게임 세션별 스냅샷"), 나중에 프로필을 바꿔도 지난
+-- 기록은 안 변한다.
+create table player_skills (
+  id               uuid primary key default gen_random_uuid(),
+  room_id          uuid not null references rooms(id) on delete cascade,
+  member_id        uuid not null references members(id) on delete cascade,
+  skill_category   text not null,
+  skill_level      int not null default 0,
+  preference_level int not null default 0,
+  updated_at       timestamptz not null default now(),
+  unique (room_id, member_id, skill_category)
 );
 
 create index members_room_id_idx on members(room_id);
@@ -150,6 +179,7 @@ create index role_conflicts_room_id_idx on role_conflicts(room_id);
 create index role_conflict_choices_conflict_id_idx on role_conflict_choices(conflict_id);
 create index role_conflict_choices_room_id_idx on role_conflict_choices(room_id);
 create index custom_roles_room_id_idx on custom_roles(room_id);
+create index player_skills_room_id_idx on player_skills(room_id);
 
 alter table rooms enable row level security;
 alter table members enable row level security;
@@ -159,6 +189,7 @@ alter table role_assignments enable row level security;
 alter table role_conflicts enable row level security;
 alter table role_conflict_choices enable row level security;
 alter table custom_roles enable row level security;
+alter table player_skills enable row level security;
 
 create policy rooms_open on rooms for all using (true) with check (true);
 create policy members_open on members for all using (true) with check (true);
@@ -168,6 +199,7 @@ create policy role_assignments_open on role_assignments for all using (true) wit
 create policy role_conflicts_open on role_conflicts for all using (true) with check (true);
 create policy role_conflict_choices_open on role_conflict_choices for all using (true) with check (true);
 create policy custom_roles_open on custom_roles for all using (true) with check (true);
+create policy player_skills_open on player_skills for all using (true) with check (true);
 
 -- 실시간 반영 — 같은 방을 열어둔 다른 사람 화면에 즉시 보이게 한다.
 alter publication supabase_realtime add table public.rooms;
@@ -178,6 +210,7 @@ alter publication supabase_realtime add table public.role_assignments;
 alter publication supabase_realtime add table public.role_conflicts;
 alter publication supabase_realtime add table public.role_conflict_choices;
 alter publication supabase_realtime add table public.custom_roles;
+alter publication supabase_realtime add table public.player_skills;
 
 -- 기본 REPLICA IDENTITY(기본키만)로는 DELETE된 행의 room_id를 알 수 없어서, room_id로
 -- 거는 postgres_changes 필터(위 클라이언트 구독 전부가 이 패턴)가 DELETE 이벤트에 대해
@@ -189,6 +222,7 @@ alter table role_preferences replica identity full;
 alter table role_conflicts replica identity full;
 alter table role_conflict_choices replica identity full;
 alter table custom_roles replica identity full;
+alter table player_skills replica identity full;
 
 -- ============================================================
 -- draw_winner: 가중치 기반 뽑기를 원자적으로 처리하는 함수.
@@ -374,3 +408,30 @@ alter table role_preferences replica identity full;
 alter table role_conflicts replica identity full;
 alter table role_conflict_choices replica identity full;
 alter table custom_roles replica identity full;
+
+-- ============================================================
+-- 마이그레이션 6: 플레이어 능력/선호 시스템.
+-- 능력/선호는 결과를 자동으로 정하지 않는다 — 충돌 카드와 결과 화면에 "참고 정보"로만
+-- 보여주고, 실제 결정은 여전히 우선권/양보/승부(+가위바위보)가 한다.
+-- ============================================================
+alter table custom_roles add column if not exists skill_category text;
+alter table role_conflicts add column if not exists candidate_skills jsonb;
+alter table role_assignments add column if not exists skill_level int;
+alter table role_assignments add column if not exists preference_level int;
+
+create table if not exists player_skills (
+  id               uuid primary key default gen_random_uuid(),
+  room_id          uuid not null references rooms(id) on delete cascade,
+  member_id        uuid not null references members(id) on delete cascade,
+  skill_category   text not null,
+  skill_level      int not null default 0,
+  preference_level int not null default 0,
+  updated_at       timestamptz not null default now(),
+  unique (room_id, member_id, skill_category)
+);
+
+create index if not exists player_skills_room_id_idx on player_skills(room_id);
+alter table player_skills enable row level security;
+create policy player_skills_open on player_skills for all using (true) with check (true);
+alter publication supabase_realtime add table public.player_skills;
+alter table player_skills replica identity full;

@@ -5,6 +5,7 @@ import type {
   CustomRole,
   Draw,
   Member,
+  PlayerSkill,
   Room,
   RoleAssignment,
   RoleConflict,
@@ -43,12 +44,14 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
       { data: conflicts },
       { data: conflictChoices },
       { data: customRoles },
+      { data: playerSkills },
     ] = await Promise.all([
       supabase.from("role_preferences").select("*").eq("room_id", room.id),
       supabase.from("role_assignments").select("*").eq("room_id", room.id),
       supabase.from("role_conflicts").select("*").eq("room_id", room.id),
       supabase.from("role_conflict_choices").select("*").eq("room_id", room.id),
       supabase.from("custom_roles").select("*").eq("room_id", room.id).order("created_at", { ascending: true }),
+      supabase.from("player_skills").select("*").eq("room_id", room.id),
     ]);
 
     return (
@@ -60,7 +63,9 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
         initialConflicts={(conflicts ?? []) as RoleConflict[]}
         initialConflictChoices={(conflictChoices ?? []) as RoleConflictChoice[]}
         initialCustomRoles={(customRoles ?? []) as CustomRole[]}
+        initialPlayerSkills={(playerSkills ?? []) as PlayerSkill[]}
         recommendedRoles={situationInfo.situation.roles}
+        skillCategories={situationInfo.situation.skills}
         situationLabel={`${situationInfo.category.label} · ${situationInfo.situation.label}`}
         recurring={situationInfo.situation.recurring}
       />

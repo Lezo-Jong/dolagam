@@ -14,6 +14,8 @@ import {
   removeMember,
   resolveRoles,
   restartRound,
+  setPreferenceLevel,
+  setSkillLevel,
   startGame,
   submitConflictChoice,
   submitPreference,
@@ -26,6 +28,7 @@ import type {
   ConflictChoice,
   CustomRole,
   Member,
+  PlayerSkill,
   Room,
   RoleAssignment,
   RoleConflict,
@@ -42,7 +45,9 @@ export function RoleGameView({
   initialConflicts,
   initialConflictChoices,
   initialCustomRoles,
+  initialPlayerSkills,
   recommendedRoles,
+  skillCategories,
   situationLabel,
   recurring,
 }: {
@@ -53,7 +58,9 @@ export function RoleGameView({
   initialConflicts: RoleConflict[];
   initialConflictChoices: RoleConflictChoice[];
   initialCustomRoles: CustomRole[];
+  initialPlayerSkills: PlayerSkill[];
   recommendedRoles: string[];
+  skillCategories: string[];
   situationLabel: string;
   recurring: boolean;
 }) {
@@ -66,6 +73,7 @@ export function RoleGameView({
   const [conflicts, setConflicts] = useState(initialConflicts);
   const [conflictChoices, setConflictChoices] = useState(initialConflictChoices);
   const [customRoles, setCustomRoles] = useState(initialCustomRoles);
+  const [playerSkills, setPlayerSkills] = useState(initialPlayerSkills);
 
   // 이번 게임에서 실제로 쓰기로 고른 역할들("게임 시작" 누르기 전까지는 이 브라우저만
   // 아는 초안이다 — 다 같이 실시간으로 체크박스를 맞출 필요까진 없어서 로컬로 둔다).
@@ -95,9 +103,11 @@ export function RoleGameView({
   const [newRoleName, setNewRoleName] = useState("");
   const [newRoleDescription, setNewRoleDescription] = useState("");
   const [roleActionError, setRoleActionError] = useState<string | null>(null);
+  const [newRoleSkill, setNewRoleSkill] = useState("");
   const [editingRoleId, setEditingRoleId] = useState<string | null>(null);
   const [editRoleName, setEditRoleName] = useState("");
   const [editRoleDescription, setEditRoleDescription] = useState("");
+  const [editRoleSkill, setEditRoleSkill] = useState("");
 
   const storedMemberId = useSyncExternalStore(
     () => () => {},
@@ -253,6 +263,24 @@ export function RoleGameView({
           }
         }
       )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "player_skills", filter: `room_id=eq.${room.id}` },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            const old = payload.old as Partial<PlayerSkill>;
+            setPlayerSkills((current) => current.filter((s) => s.id !== old.id));
+            return;
+          }
+          const next = payload.new as PlayerSkill;
+          setPlayerSkills((current) => {
+            const withoutOld = current.filter(
+              (s) => !(s.member_id === next.member_id && s.skill_category === next.skill_category)
+            );
+            return [...withoutOld, next];
+          });
+        }
+      )
       .subscribe();
 
     return () => {
@@ -316,13 +344,20 @@ export function RoleGameView({
     if (!myMemberId) return;
     setRoleActionError(null);
     startRoleAction(async () => {
-      const result = await addCustomRole(room.id, myMemberId, newRoleName, newRoleDescription);
+      const result = await addCustomRole(
+        room.id,
+        myMemberId,
+        newRoleName,
+        newRoleDescription,
+        newRoleSkill || null
+      );
       if (!result.ok) {
         setRoleActionError(result.error);
         return;
       }
       setNewRoleName("");
       setNewRoleDescription("");
+      setNewRoleSkill("");
       setAddingRole(false);
     });
   }
@@ -331,19 +366,36 @@ export function RoleGameView({
     setEditingRoleId(role.id);
     setEditRoleName(role.name);
     setEditRoleDescription(role.description ?? "");
+    setEditRoleSkill(role.skill_category ?? "");
   }
 
   function handleSaveRoleEdit() {
     if (!myMemberId || !editingRoleId) return;
     setRoleActionError(null);
     startRoleAction(async () => {
-      const result = await updateCustomRole(editingRoleId, myMemberId, editRoleName, editRoleDescription);
+      const result = await updateCustomRole(
+        editingRoleId,
+        myMemberId,
+        editRoleName,
+        editRoleDescription,
+        editRoleSkill || null
+      );
       if (!result.ok) {
         setRoleActionError(result.error);
         return;
       }
       setEditingRoleId(null);
     });
+  }
+
+  function handleSetSkill(category: string, level: number) {
+    if (!myMemberId) return;
+    setSkillLevel(room.id, myMemberId, category, level);
+  }
+
+  function handleSetPreference(category: string, level: number) {
+    if (!myMemberId) return;
+    setPreferenceLevel(room.id, myMemberId, category, level);
   }
 
   function handleDeleteRole(roleId: string) {
@@ -554,6 +606,18 @@ export function RoleGameView({
                         placeholder="역할 설명(선택)"
                         className="rounded-lg border border-zinc-300 bg-white px-2 py-1 text-sm text-zinc-900 outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50"
                       />
+                      <select
+                        value={editRoleSkill}
+                        onChange={(e) => setEditRoleSkill(e.target.value)}
+                        className="rounded-lg border border-zinc-300 bg-white px-2 py-1 text-sm text-zinc-900 outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50"
+                      >
+                        <option value="">관련 능력 없음</option>
+                        {skillCategories.map((skill) => (
+                          <option key={skill} value={skill}>
+                            {skill}
+                          </option>
+                        ))}
+                      </select>
                       <div className="flex gap-2">
                         <button
                           onClick={handleSaveRoleEdit}
@@ -616,6 +680,18 @@ export function RoleGameView({
                   placeholder="역할 설명(선택)"
                   className="rounded-lg border border-zinc-300 bg-white px-2 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50"
                 />
+                <select
+                  value={newRoleSkill}
+                  onChange={(e) => setNewRoleSkill(e.target.value)}
+                  className="rounded-lg border border-zinc-300 bg-white px-2 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50"
+                >
+                  <option value="">관련 능력 없음</option>
+                  {skillCategories.map((skill) => (
+                    <option key={skill} value={skill}>
+                      {skill}
+                    </option>
+                  ))}
+                </select>
                 <div className="flex gap-2">
                   <button
                     onClick={handleAddRole}
@@ -661,6 +737,16 @@ export function RoleGameView({
           )}
           {startError && <p className="text-center text-sm text-red-500">{startError}</p>}
         </section>
+      )}
+
+      {room.game_phase === "preference" && me && skillCategories.length > 0 && (
+        <SkillRatingSection
+          skillCategories={skillCategories}
+          playerSkills={playerSkills}
+          myMemberId={myMemberId}
+          onSetSkill={handleSetSkill}
+          onSetPreference={handleSetPreference}
+        />
       )}
 
       {room.game_phase === "preference" && (
@@ -786,6 +872,11 @@ export function RoleGameView({
                         <span>{rankBadge(a.assigned_rank)}</span>
                         {resolutionTag(a.resolved_by) && <span>· {resolutionTag(a.resolved_by)}</span>}
                       </div>
+                      {a.skill_level != null && (
+                        <p className="mt-1 text-xs text-zinc-400">
+                          능력 {skillStars(a.skill_level) || "–"} · 선호 {prefHearts(a.preference_level) || "–"}
+                        </p>
+                      )}
                     </div>
                   ))}
               </div>
@@ -878,9 +969,16 @@ function HistorySection({
               key={a.id}
               className="flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
             >
-              <span className="font-medium text-zinc-900 dark:text-zinc-50">
-                {a.member_name} → {a.role_label}
-              </span>
+              <div>
+                <span className="font-medium text-zinc-900 dark:text-zinc-50">
+                  {a.member_name} → {a.role_label}
+                </span>
+                {a.skill_level != null && (
+                  <p className="text-xs text-zinc-400">
+                    능력 {skillStars(a.skill_level) || "–"} · 선호 {prefHearts(a.preference_level) || "–"}
+                  </p>
+                )}
+              </div>
               <span className="text-xs text-zinc-400">{rankBadge(a.assigned_rank)}</span>
             </div>
           ))}
@@ -928,6 +1026,96 @@ function rankBadge(assignedRank: number | null): string {
   return "💤 비선호 역할";
 }
 
+// 능력/선호는 별점/하트 개수로만 간단히 보여준다 — 스펙 2번("슬라이더나 복잡한 수치
+// 입력은 쓰지 않는다")과 같은 정신으로 표시도 최대한 단순하게 유지한다.
+function skillStars(level: number | null | undefined): string {
+  return level ? "⭐".repeat(level) : "";
+}
+
+function prefHearts(level: number | null | undefined): string {
+  return level ? "❤️".repeat(level) : "";
+}
+
+// 게임 시작 전, 각자 이번 상황과 관련된 능력/선호를 스스로 매긴다(스펙 1~2번). 능력이
+// 높다고 자동으로 역할을 주지 않는다 — 이 값은 어디까지나 충돌 카드/결과에 보여주는
+// "참고 정보"고, 실제 결정은 여전히 지망 선택 + 우선권/양보/승부가 한다.
+function SkillRatingSection({
+  skillCategories,
+  playerSkills,
+  myMemberId,
+  onSetSkill,
+  onSetPreference,
+}: {
+  skillCategories: string[];
+  playerSkills: PlayerSkill[];
+  myMemberId: string | null;
+  onSetSkill: (category: string, level: number) => void;
+  onSetPreference: (category: string, level: number) => void;
+}) {
+  const mySkills = new Map(
+    playerSkills.filter((s) => s.member_id === myMemberId).map((s) => [s.skill_category, s])
+  );
+
+  return (
+    <section className="flex flex-col gap-3 rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <div>
+        <h2 className="text-sm font-semibold text-zinc-500">💪 내가 잘하는 것 / ❤️ 내가 좋아하는 것</h2>
+        <p className="text-xs text-zinc-400">참고용 정보예요 — 역할이 자동으로 정해지진 않아요.</p>
+      </div>
+      <div className="flex flex-col gap-3">
+        {skillCategories.map((category) => {
+          const current = mySkills.get(category);
+          const skillLevel = current?.skill_level ?? 0;
+          const prefLevel = current?.preference_level ?? 0;
+          return (
+            <div key={category} className="flex flex-col gap-1">
+              <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">{category}</span>
+              <div className="flex items-center gap-2">
+                <span className="w-10 shrink-0 text-xs text-zinc-400">능력</span>
+                <div className="flex gap-1">
+                  {[1, 2, 3].map((level) => (
+                    <button
+                      key={level}
+                      type="button"
+                      onClick={() => onSetSkill(category, level === skillLevel ? 0 : level)}
+                      className={`rounded-lg border px-2 py-1 text-sm transition-colors ${
+                        level <= skillLevel
+                          ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-50 dark:bg-zinc-50 dark:text-zinc-900"
+                          : "border-zinc-200 text-zinc-300 dark:border-zinc-700 dark:text-zinc-600"
+                      }`}
+                    >
+                      ⭐
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="w-10 shrink-0 text-xs text-zinc-400">선호</span>
+                <div className="flex gap-1">
+                  {[1, 2, 3].map((level) => (
+                    <button
+                      key={level}
+                      type="button"
+                      onClick={() => onSetPreference(category, level === prefLevel ? 0 : level)}
+                      className={`rounded-lg border px-2 py-1 text-sm transition-colors ${
+                        level <= prefLevel
+                          ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-50 dark:bg-zinc-50 dark:text-zinc-900"
+                          : "border-zinc-200 text-zinc-300 dark:border-zinc-700 dark:text-zinc-600"
+                      }`}
+                    >
+                      ❤️
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function resolutionTag(resolvedBy: RoleAssignment["resolved_by"]): string | null {
   if (resolvedBy === "priority") return "🔥 우선권으로 획득";
   if (resolvedBy === "duel") return "🎲 승부에서 승리";
@@ -970,6 +1158,25 @@ function ConflictCard({
       <p className="font-semibold text-zinc-900 dark:text-zinc-50">
         {conflict.role_label} <span className="font-normal text-zinc-400">— {candidateNames}</span>
       </p>
+
+      {conflict.candidate_skills && (
+        <div className="mt-2 flex flex-col gap-1 rounded-lg bg-zinc-50 p-2 text-xs text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+          {conflict.candidate_ids.map((id) => {
+            const snapshot = conflict.candidate_skills?.[id];
+            if (!snapshot) return null;
+            return (
+              <div key={id} className="flex items-center justify-between">
+                <span className="font-medium text-zinc-700 dark:text-zinc-300">
+                  {members.find((m) => m.id === id)?.name}
+                </span>
+                <span>
+                  능력 {skillStars(snapshot.skill_level) || "–"} · 선호 {prefHearts(snapshot.preference_level) || "–"}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {conflict.status === "choosing" &&
         (!iAmCandidate ? (

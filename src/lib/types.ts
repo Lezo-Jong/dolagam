@@ -71,10 +71,20 @@ export interface RoleAssignment {
   resolved_by: "preference" | "priority" | "duel" | "draw";
   round: number;
   created_at: string;
+  // 이 역할에 연결된 능력이 있으면 배정 시점의 능력/선호 스냅샷(둘 다 0~3). 연결된
+  // 능력이 없으면 둘 다 null — "능력/선호는 참고 정보일 뿐 결과를 정하지 않는다"는
+  // 원칙대로, 이 값은 표시 전용이고 배정 로직에는 관여하지 않는다.
+  skill_level: number | null;
+  preference_level: number | null;
 }
 
 export type ConflictChoice = "priority" | "concede" | "duel";
 export type RpsMove = "rock" | "paper" | "scissors";
+
+export interface SkillSnapshot {
+  skill_level: number;
+  preference_level: number;
+}
 
 export interface RoleConflict {
   id: string;
@@ -88,6 +98,9 @@ export interface RoleConflict {
   winner_id: string | null;
   winner_reason: "priority" | "duel" | "draw" | null;
   created_at: string;
+  // 충돌이 생긴 시점의 후보별 능력/선호 스냅샷: { [member_id]: {skill_level, preference_level} }.
+  // 연결된 능력이 없는 역할이면 null.
+  candidate_skills: Record<string, SkillSnapshot> | null;
 }
 
 export interface RoleConflictChoice {
@@ -109,5 +122,21 @@ export interface CustomRole {
   description: string | null;
   created_by: string | null;
   created_at: string;
+  updated_at: string;
+  // 이 역할과 연결된 능력 카테고리(situations.ts의 skills 중 하나) — 없어도 된다.
+  skill_category: string | null;
+}
+
+// 플레이어가 스스로 매기는 능력/선호("지금의 프로필"). 게임 도중 자유롭게 고칠 수
+// 있고, 이미 끝난 게임 기록은 이 값을 실시간 참조하지 않는다 — 대신 role_conflicts/
+// role_assignments에 그 순간의 값이 스냅샷으로 복사된다.
+export interface PlayerSkill {
+  id: string;
+  room_id: string;
+  member_id: string;
+  skill_category: string;
+  // 0(미설정)~3.
+  skill_level: number;
+  preference_level: number;
   updated_at: string;
 }
