@@ -10,10 +10,45 @@
 // task가 필요할 미래의 다른 문제 유형을 위해 그대로 남겨둔다).
 import { useActionState, useState } from "react";
 import { createRoom } from "@/app/actions";
+import { DECISION_PRESETS } from "@/lib/decisionPresets";
 import { PROBLEM_TYPES, type ProblemTypeId } from "@/lib/problemTypes";
 import { SITUATION_CATEGORIES } from "@/lib/situations";
 
 type Step = "problem" | "situation" | "create";
+
+// 팀 역할 정하기만 "상황"을 골라야 역할 풀이 정해진다(대학/직장/집 카테고리 브라우징).
+// 나머지 네 가지는 문제 유형 하나당 미리 정해둔 후보 세트가 하나뿐이라 상황 선택
+// 단계를 건너뛰고 바로 확인 화면으로 간다. 🛍️ 뭘 살까(budget)는 situations.ts의
+// SHOPPING_SITUATION을 그대로 쓴다 — "역할 정하기"와 완전히 같은 엔진이기 때문이다.
+const SHOPPING_PRESET = {
+  situationId: "shopping-default",
+  label: "🛍️ 쇼핑 · 생필품 사기",
+  name: "생필품 사기",
+  candidates: ["🧻 휴지", "🧴 세제", "🍜 라면", "🥤 음료", "🍪 간식"],
+  subtitle: "같이 필요한 물건을 정해보세요.",
+};
+
+const DIRECT_PRESETS: Record<
+  string,
+  { situationId: string; label: string; name: string; candidates: string[]; subtitle: string }
+> = {
+  budget: SHOPPING_PRESET,
+  ...Object.fromEntries(
+    DECISION_PRESETS.map((p) => [
+      p.problemType,
+      {
+        situationId: p.id,
+        label: p.label,
+        name: p.label,
+        candidates: p.candidates,
+        subtitle:
+          p.mode === "single-choice"
+            ? "다 같이 하나로 정해보세요."
+            : "해야 할 일의 순서를 정해보세요.",
+      },
+    ])
+  ),
+};
 
 export function NewRoomWizard() {
   const [step, setStep] = useState<Step>("problem");
@@ -22,6 +57,7 @@ export function NewRoomWizard() {
   const [situationLabel, setSituationLabel] = useState<string | null>(null);
   const [situationName, setSituationName] = useState<string>("");
   const [situationRoles, setSituationRoles] = useState<string[]>([]);
+  const [subtitle, setSubtitle] = useState<string>("이 역할들을 나눠 맡아요.");
 
   if (step === "problem") {
     return (
@@ -41,7 +77,17 @@ export function NewRoomWizard() {
               disabled={!pt.enabled}
               onClick={() => {
                 setProblemType(pt.id);
-                setStep("situation");
+                const preset = DIRECT_PRESETS[pt.id];
+                if (preset) {
+                  setSituationId(preset.situationId);
+                  setSituationLabel(preset.label);
+                  setSituationName(preset.name);
+                  setSituationRoles(preset.candidates);
+                  setSubtitle(preset.subtitle);
+                  setStep("create");
+                } else {
+                  setStep("situation");
+                }
               }}
               className="flex w-full items-center gap-3 rounded-xl border border-zinc-200 bg-white px-4 py-3 text-left transition-colors hover:border-zinc-900 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-zinc-200 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-zinc-50 dark:disabled:hover:border-zinc-800"
             >
@@ -97,6 +143,7 @@ export function NewRoomWizard() {
                       setSituationLabel(`${category.label} · ${s.label}`);
                       setSituationName(s.label);
                       setSituationRoles(s.roles);
+                      setSubtitle("이 역할들을 나눠 맡아요.");
                       setStep("create");
                     }}
                     className="rounded-full border border-zinc-300 bg-white px-3.5 py-1.5 text-sm text-zinc-700 transition-colors hover:border-zinc-900 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-zinc-50 dark:hover:text-zinc-50"
@@ -117,7 +164,7 @@ export function NewRoomWizard() {
       <div className="flex flex-col gap-1">
         <button
           type="button"
-          onClick={() => setStep("situation")}
+          onClick={() => setStep(problemType && DIRECT_PRESETS[problemType] ? "problem" : "situation")}
           className="self-start text-sm text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
         >
           ← 이전
@@ -126,7 +173,7 @@ export function NewRoomWizard() {
           <h1 className="text-3xl font-bold tracking-tight text-zinc-900 dark:text-zinc-50">
             돌아가면요
           </h1>
-          <p className="text-base text-zinc-600 dark:text-zinc-400">이 역할들을 나눠 맡아요.</p>
+          <p className="text-base text-zinc-600 dark:text-zinc-400">{subtitle}</p>
           {situationLabel && <p className="text-sm text-zinc-400">{situationLabel}</p>}
         </div>
       </div>

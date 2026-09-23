@@ -127,6 +127,23 @@ export const SITUATION_CATEGORIES: SituationCategory[] = [
   },
 ];
 
+// 🛍️ 뭘 살까(problem_type='budget')는 "역할 정하기"와 완전히 같은 엔진을 쓴다 — 물건도
+// "역할"처럼 한 사람에게 배정되는 것뿐이다(담당자 배정). 그래서 새 게임 로직을 만들지
+// 않고 이 Situation 카탈로그에 하나만 더 얹는다. 다만 대학/직장/집 상황 목록(사람이
+// "역할 정하기"를 고를 때 고르는 목록)에는 안 섞이게 SITUATION_CATEGORIES엔 안 넣고
+// findSituation에서만 별도로 찾는다.
+const SHOPPING_SITUATION: { category: SituationCategory; situation: Situation } = {
+  category: { id: "shopping", label: "쇼핑", emoji: "🛍️", situations: [] },
+  situation: {
+    id: "shopping-default",
+    label: "생필품 사기",
+    roles: ["🧻 휴지", "🧴 세제", "🍜 라면", "🥤 음료", "🍪 간식"],
+    recurring: false,
+    skills: [],
+    roleSkills: {},
+  },
+};
+
 export function findSituation(
   situationId: string | null | undefined
 ): { category: SituationCategory; situation: Situation } | null {
@@ -135,5 +152,6 @@ export function findSituation(
     const situation = category.situations.find((s) => s.id === situationId);
     if (situation) return { category, situation };
   }
+  if (situationId === SHOPPING_SITUATION.situation.id) return SHOPPING_SITUATION;
   return null;
 }

@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 import { getSupabase } from "@/lib/supabase";
 import { findSituation } from "@/lib/situations";
+import { findDecisionPreset } from "@/lib/decisionPresets";
 import type {
   CustomRole,
   Draw,
@@ -15,6 +16,7 @@ import type {
 } from "@/lib/types";
 import { RoomView } from "@/components/RoomView";
 import { RoleGameView } from "@/components/RoleGameView";
+import { DecisionGameView } from "@/components/DecisionGameView";
 
 export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
   const { slug } = await params;
@@ -72,6 +74,44 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
         skillCategories={situationInfo.situation.skills}
         situationLabel={`${situationInfo.category.label} · ${situationInfo.situation.label}`}
         recurring={situationInfo.situation.recurring}
+      />
+    );
+  }
+
+  // 🍚 뭘 먹을까 / 📋 뭐부터 할까 / 🕐 언제 만날까(decisionPresets.ts) — "역할 정하기"와
+  // 같은 충돌 해결 엔진을 쓰지만 결과 모양이 달라서(그룹 전체가 하나의 답 / 순서) 별도
+  // 화면(DecisionGameView)으로 그린다. 🛍️ 뭘 살까(budget)는 situations.ts에 이미
+  // 얹어놨으니 위 situationInfo 분기에서 RoleGameView로 처리된다.
+  const decisionPreset = findDecisionPreset(room.situation);
+  if (decisionPreset) {
+    const [
+      { data: preferences },
+      { data: assignments },
+      { data: conflicts },
+      { data: conflictChoices },
+      { data: customCandidates },
+    ] = await Promise.all([
+      supabase.from("role_preferences").select("*").eq("room_id", room.id),
+      supabase.from("role_assignments").select("*").eq("room_id", room.id),
+      supabase.from("role_conflicts").select("*").eq("room_id", room.id),
+      supabase.from("role_conflict_choices").select("*").eq("room_id", room.id),
+      supabase.from("custom_roles").select("*").eq("room_id", room.id).order("created_at", { ascending: true }),
+    ]);
+
+    return (
+      <DecisionGameView
+        initialRoom={room as Room}
+        initialMembers={(members ?? []) as Member[]}
+        initialPreferences={(preferences ?? []) as RolePreference[]}
+        initialAssignments={(assignments ?? []) as RoleAssignment[]}
+        initialConflicts={(conflicts ?? []) as RoleConflict[]}
+        initialConflictChoices={(conflictChoices ?? []) as RoleConflictChoice[]}
+        initialCustomCandidates={(customCandidates ?? []) as CustomRole[]}
+        defaultCandidates={decisionPreset.candidates}
+        mode={decisionPreset.mode}
+        label={decisionPreset.label}
+        resultTitle={decisionPreset.resultTitle}
+        situationLabel={decisionPreset.label}
       />
     );
   }
