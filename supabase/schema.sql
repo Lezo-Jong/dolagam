@@ -19,18 +19,28 @@ create table rooms (
   -- 방을 만들 때 고른 상황(src/lib/situations.ts의 situation id). 참고용 정보라 선택
   -- 안 해도 그만이라 null 허용.
   situation    text,
-  -- 게임 진행 단계: lobby(참가자 모으기) -> preference(1지망 선택) -> result(역할 확정).
-  -- situation이 situations.ts의 프리셋과 매칭되지 않는 예전 방(단순 task 한 줄짜리)은
-  -- 이 값과 무관하게 예전 화면(RoomView)을 그대로 보여준다 — 하위 호환.
-  game_phase   text not null default 'lobby'
+  -- 게임 진행 단계: lobby(참가자 모으기) -> preference(지망 선택) -> conflict(충돌 해결
+  -- 중) -> result(역할 확정). situation이 situations.ts의 프리셋과 매칭되지 않는 예전
+  -- 방(단순 task 한 줄짜리)은 이 값과 무관하게 예전 화면(RoomView)을 그대로 보여준다.
+  game_phase   text not null default 'lobby',
+  -- 지금 진행 중인 라운드에서 몇 지망까지 처리했는지(충돌 해결이 여러 지망에 걸쳐
+  -- 진행되므로 서버가 "다음엔 몇 지망을 볼 차례인지" 기억해야 한다).
+  conflict_rank int not null default 0,
+  -- "다음 지망으로 넘어가는 중" 락. 서로 다른 두 충돌이 거의 동시에 끝나면 두 요청이
+  -- 동시에 다음 단계로 넘어가려다 결과가 중복 생성될 수 있어서, 이 값으로 한 번에
+  -- 하나의 요청만 넘어가게 막는다(processNextRank 참고).
+  advancing     boolean not null default false
 );
 
 create table members (
-  id                 uuid primary key default gen_random_uuid(),
-  room_id            uuid not null references rooms(id) on delete cascade,
-  name               text not null,
-  last_picked_round  int not null default 0,
-  created_at         timestamptz not null default now()
+  id                   uuid primary key default gen_random_uuid(),
+  room_id              uuid not null references rooms(id) on delete cascade,
+  name                 text not null,
+  last_picked_round    int not null default 0,
+  created_at           timestamptz not null default now(),
+  -- 역할 충돌 시 쓸 수 있는 우선권. 게임(라운드)마다 1개씩 새로 주어지고, 한 번 쓰면
+  -- 그 라운드 동안은 다시 못 쓴다(restartRound에서 초기화됨).
+  priority_token_used  boolean not null default false
 );
 
 -- 뽑기 기록. member_id는 멤버가 삭제되면 null로 풀리지만(on delete set null),
@@ -75,22 +85,61 @@ create table role_assignments (
   created_at    timestamptz not null default now()
 );
 
+-- 같은 지망 단계에서 역할 하나에 2명 이상 몰리면 생기는 "충돌" 하나. candidate_ids는
+-- 그 역할을 이 지망으로 고른 사람 전원, finalist_ids는 우선권/양보/승부 1단계를 거쳐
+-- 가위바위보까지 가야 하는 사람만 남긴 좁혀진 목록(2단계 전엔 null).
+create table role_conflicts (
+  id            uuid primary key default gen_random_uuid(),
+  room_id       uuid not null references rooms(id) on delete cascade,
+  round         int not null,
+  rank          int not null,
+  role_label    text not null,
+  candidate_ids uuid[] not null,
+  finalist_ids  uuid[],
+  status        text not null default 'choosing', -- 'choosing' | 'rps' | 'resolved'
+  winner_id     uuid references members(id) on delete set null,
+  winner_reason text, -- 'priority' | 'duel' | 'draw'
+  created_at    timestamptz not null default now()
+);
+
+-- 충돌 참가자 각자의 선택. choice는 1단계(우선권/양보/승부), rps_move는 2단계(가위바위보)
+-- — 둘 다 같은 행에 저장해서 "이 사람이 이 충돌에서 뭘 했는지"를 한 줄로 추적한다.
+-- room_id는 role_conflicts로도 알 수 있지만, Realtime 구독 필터(room_id=eq.…)를 걸려면
+-- 이 테이블에도 있어야 해서 그대로 중복 저장한다.
+create table role_conflict_choices (
+  id          uuid primary key default gen_random_uuid(),
+  room_id     uuid not null references rooms(id) on delete cascade,
+  conflict_id uuid not null references role_conflicts(id) on delete cascade,
+  member_id   uuid not null references members(id) on delete cascade,
+  choice      text, -- 'priority' | 'concede' | 'duel'
+  rps_move    text, -- 'rock' | 'paper' | 'scissors'
+  created_at  timestamptz not null default now(),
+  unique (conflict_id, member_id)
+);
+
 create index members_room_id_idx on members(room_id);
 create index draws_room_id_idx on draws(room_id);
 create index role_preferences_room_id_idx on role_preferences(room_id);
 create index role_assignments_room_id_idx on role_assignments(room_id);
+create index role_conflicts_room_id_idx on role_conflicts(room_id);
+create index role_conflict_choices_conflict_id_idx on role_conflict_choices(conflict_id);
+create index role_conflict_choices_room_id_idx on role_conflict_choices(room_id);
 
 alter table rooms enable row level security;
 alter table members enable row level security;
 alter table draws enable row level security;
 alter table role_preferences enable row level security;
 alter table role_assignments enable row level security;
+alter table role_conflicts enable row level security;
+alter table role_conflict_choices enable row level security;
 
 create policy rooms_open on rooms for all using (true) with check (true);
 create policy members_open on members for all using (true) with check (true);
 create policy draws_open on draws for all using (true) with check (true);
 create policy role_preferences_open on role_preferences for all using (true) with check (true);
 create policy role_assignments_open on role_assignments for all using (true) with check (true);
+create policy role_conflicts_open on role_conflicts for all using (true) with check (true);
+create policy role_conflict_choices_open on role_conflict_choices for all using (true) with check (true);
 
 -- 실시간 반영 — 같은 방을 열어둔 다른 사람 화면에 즉시 보이게 한다.
 alter publication supabase_realtime add table public.rooms;
@@ -98,6 +147,8 @@ alter publication supabase_realtime add table public.members;
 alter publication supabase_realtime add table public.draws;
 alter publication supabase_realtime add table public.role_preferences;
 alter publication supabase_realtime add table public.role_assignments;
+alter publication supabase_realtime add table public.role_conflicts;
+alter publication supabase_realtime add table public.role_conflict_choices;
 
 -- ============================================================
 -- draw_winner: 가중치 기반 뽑기를 원자적으로 처리하는 함수.
@@ -201,3 +252,50 @@ alter publication supabase_realtime add table public.role_assignments;
 -- ============================================================
 alter table role_preferences add constraint role_preferences_room_member_role_key unique (room_id, member_id, role_label);
 alter table role_assignments add column if not exists assigned_rank int;
+
+-- ============================================================
+-- 마이그레이션 3: 충돌 해결 게임(우선권/양보/승부 + 가위바위보) 추가.
+-- ============================================================
+alter table rooms add column if not exists conflict_rank int not null default 0;
+alter table members add column if not exists priority_token_used boolean not null default false;
+
+create table if not exists role_conflicts (
+  id            uuid primary key default gen_random_uuid(),
+  room_id       uuid not null references rooms(id) on delete cascade,
+  round         int not null,
+  rank          int not null,
+  role_label    text not null,
+  candidate_ids uuid[] not null,
+  finalist_ids  uuid[],
+  status        text not null default 'choosing',
+  winner_id     uuid references members(id) on delete set null,
+  winner_reason text,
+  created_at    timestamptz not null default now()
+);
+
+create table if not exists role_conflict_choices (
+  id          uuid primary key default gen_random_uuid(),
+  room_id     uuid not null references rooms(id) on delete cascade,
+  conflict_id uuid not null references role_conflicts(id) on delete cascade,
+  member_id   uuid not null references members(id) on delete cascade,
+  choice      text,
+  rps_move    text,
+  created_at  timestamptz not null default now(),
+  unique (conflict_id, member_id)
+);
+
+create index if not exists role_conflicts_room_id_idx on role_conflicts(room_id);
+create index if not exists role_conflict_choices_conflict_id_idx on role_conflict_choices(conflict_id);
+
+alter table role_conflicts enable row level security;
+alter table role_conflict_choices enable row level security;
+create policy role_conflicts_open on role_conflicts for all using (true) with check (true);
+create policy role_conflict_choices_open on role_conflict_choices for all using (true) with check (true);
+alter publication supabase_realtime add table public.role_conflicts;
+alter publication supabase_realtime add table public.role_conflict_choices;
+
+-- ============================================================
+-- 마이그레이션 3 추가분: 두 충돌이 거의 동시에 끝날 때 결과가 중복 생성되던 레이스
+-- 컨디션을 막기 위한 락 컬럼. 마이그레이션 3을 이미 실행한 프로젝트는 이 줄만 실행한다.
+-- ============================================================
+alter table rooms add column if not exists advancing boolean not null default false;

@@ -12,17 +12,30 @@ import {
   resolveRoles,
   restartRound,
   startGame,
+  submitConflictChoice,
   submitPreference,
+  submitRpsMove,
 } from "@/app/actions";
 import { getMyMemberId, setMyMemberId } from "@/lib/identity";
 import { getSupabase } from "@/lib/supabase";
-import type { Member, Room, RoleAssignment, RolePreference } from "@/lib/types";
+import type {
+  ConflictChoice,
+  Member,
+  Room,
+  RoleAssignment,
+  RoleConflict,
+  RoleConflictChoice,
+  RolePreference,
+  RpsMove,
+} from "@/lib/types";
 
 export function RoleGameView({
   initialRoom,
   initialMembers,
   initialPreferences,
   initialAssignments,
+  initialConflicts,
+  initialConflictChoices,
   roles,
   situationLabel,
 }: {
@@ -30,6 +43,8 @@ export function RoleGameView({
   initialMembers: Member[];
   initialPreferences: RolePreference[];
   initialAssignments: RoleAssignment[];
+  initialConflicts: RoleConflict[];
+  initialConflictChoices: RoleConflictChoice[];
   roles: string[];
   situationLabel: string;
 }) {
@@ -38,6 +53,8 @@ export function RoleGameView({
   const [members, setMembers] = useState(initialMembers);
   const [preferences, setPreferences] = useState(initialPreferences);
   const [assignments, setAssignments] = useState(initialAssignments);
+  const [conflicts, setConflicts] = useState(initialConflicts);
+  const [conflictChoices, setConflictChoices] = useState(initialConflictChoices);
 
   const storedMemberId = useSyncExternalStore(
     () => () => {},
@@ -132,6 +149,36 @@ export function RoleGameView({
           });
         }
       )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "role_conflicts", filter: `room_id=eq.${room.id}` },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            const old = payload.old as Partial<RoleConflict>;
+            setConflicts((current) => current.filter((c) => c.id !== old.id));
+            return;
+          }
+          const next = payload.new as RoleConflict;
+          setConflicts((current) => {
+            if (payload.eventType === "INSERT" && current.some((c) => c.id === next.id)) return current;
+            if (payload.eventType === "UPDATE") return current.map((c) => (c.id === next.id ? next : c));
+            return [...current, next];
+          });
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "role_conflict_choices", filter: `room_id=eq.${room.id}` },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            const old = payload.old as Partial<RoleConflictChoice>;
+            setConflictChoices((current) => current.filter((c) => c.id !== old.id));
+            return;
+          }
+          const next = payload.new as RoleConflictChoice;
+          setConflictChoices((current) => [...current.filter((c) => c.id !== next.id), next]);
+        }
+      )
       .subscribe();
 
     return () => {
@@ -190,6 +237,16 @@ export function RoleGameView({
     submitPreference(room.id, myMemberId, rank, roleLabel);
   }
 
+  function handleConflictChoice(conflictId: string, choice: ConflictChoice) {
+    if (!myMemberId) return;
+    submitConflictChoice(room.id, conflictId, myMemberId, choice);
+  }
+
+  function handleRpsMove(conflictId: string, move: RpsMove) {
+    if (!myMemberId) return;
+    submitRpsMove(conflictId, myMemberId, move);
+  }
+
   function handleResolve() {
     setResolveError(null);
     startResolving(async () => {
@@ -213,6 +270,12 @@ export function RoleGameView({
   const tally1 = new Map<string, number>();
   for (const role of roles) tally1.set(role, 0);
   for (const p of preferences) if (p.rank === 1) tally1.set(p.role_label, (tally1.get(p.role_label) ?? 0) + 1);
+
+  // 지금 진행 중인 라운드(아직 game_phase가 'result'로 안 바뀐 라운드)를 기준으로,
+  // 이미 배정 끝난 역할(충돌 없이 바로 정해진 것들)과 아직 진행 중인 충돌을 나눠 보여준다.
+  const workingRound = room.round + 1;
+  const settledThisRound = assignments.filter((a) => a.round === workingRound);
+  const activeConflicts = conflicts.filter((c) => c.round === workingRound && c.status !== "resolved");
 
   return (
     <div className="mx-auto flex w-full max-w-md flex-1 flex-col gap-6 px-4 py-8">
@@ -369,12 +432,47 @@ export function RoleGameView({
             disabled={resolving}
             className="mt-2 h-12 w-full rounded-xl bg-zinc-900 text-base font-bold text-white transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-300"
           >
-            {resolving ? "결정하는 중..." : "결과 확정하기"}
+            {resolving ? "확인하는 중..." : "충돌 확인하기"}
           </button>
           <p className="text-center text-sm text-zinc-500">
-            지망이 겹치면 그 사람들끼리만 뽑기로 정하고, 진 사람은 다음 지망으로 다시 시도해요.
+            지망이 겹치는 역할만 우선권·양보·승부로 정하고, 나머지는 바로 배정돼요.
           </p>
           {resolveError && <p className="text-center text-sm text-red-500">{resolveError}</p>}
+        </section>
+      )}
+
+      {room.game_phase === "conflict" && (
+        <section className="flex flex-col gap-3">
+          <h2 className="text-sm font-semibold text-zinc-500">{room.conflict_rank}지망 충돌 해결 중</h2>
+
+          {settledThisRound.length > 0 && (
+            <div className="flex flex-col gap-1 rounded-xl border border-zinc-200 bg-white p-3 text-sm dark:border-zinc-800 dark:bg-zinc-900">
+              <span className="text-xs font-semibold text-zinc-400">이미 정해진 역할</span>
+              {settledThisRound.map((a) => (
+                <div key={a.id} className="flex items-center justify-between">
+                  <span className="text-zinc-700 dark:text-zinc-300">
+                    {a.member_name} → {a.role_label}
+                  </span>
+                  <span className="text-zinc-400">{rankBadge(a.assigned_rank)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="flex flex-col gap-3">
+            {activeConflicts.map((conflict) => (
+              <ConflictCard
+                key={conflict.id}
+                conflict={conflict}
+                members={members}
+                choices={conflictChoices}
+                myMemberId={myMemberId}
+                myPriorityUsed={me?.priority_token_used ?? false}
+                onChoice={handleConflictChoice}
+                onRpsMove={handleRpsMove}
+              />
+            ))}
+          </div>
         </section>
       )}
 
@@ -389,9 +487,14 @@ export function RoleGameView({
                   key={a.id}
                   className="flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
                 >
-                  <span className="font-medium text-zinc-900 dark:text-zinc-50">
-                    {a.member_name} → {a.role_label}
-                  </span>
+                  <div>
+                    <span className="font-medium text-zinc-900 dark:text-zinc-50">
+                      {a.member_name} → {a.role_label}
+                    </span>
+                    {resolutionTag(a.resolved_by) && (
+                      <p className="text-xs text-zinc-400">{resolutionTag(a.resolved_by)}</p>
+                    )}
+                  </div>
                   <span className="text-xs text-zinc-400">{rankBadge(a.assigned_rank)}</span>
                 </li>
               ))}
@@ -414,4 +517,131 @@ function rankBadge(assignedRank: number | null): string {
   if (assignedRank === 2) return "👍 2지망";
   if (assignedRank === 3) return "😅 3지망";
   return "💤 비선호 역할";
+}
+
+function resolutionTag(resolvedBy: RoleAssignment["resolved_by"]): string | null {
+  if (resolvedBy === "priority") return "🔥 우선권으로 획득";
+  if (resolvedBy === "duel") return "🎲 승부에서 승리";
+  return null;
+}
+
+function ConflictCard({
+  conflict,
+  members,
+  choices,
+  myMemberId,
+  myPriorityUsed,
+  onChoice,
+  onRpsMove,
+}: {
+  conflict: RoleConflict;
+  members: Member[];
+  choices: RoleConflictChoice[];
+  myMemberId: string | null;
+  myPriorityUsed: boolean;
+  onChoice: (conflictId: string, choice: ConflictChoice) => void;
+  onRpsMove: (conflictId: string, move: RpsMove) => void;
+}) {
+  const candidateNames = conflict.candidate_ids
+    .map((id) => members.find((m) => m.id === id)?.name)
+    .filter(Boolean)
+    .join(" vs ");
+
+  const myChoice = choices.find((c) => c.conflict_id === conflict.id && c.member_id === myMemberId);
+  const iAmCandidate = myMemberId != null && conflict.candidate_ids.includes(myMemberId);
+
+  return (
+    <div className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+      <p className="font-semibold text-zinc-900 dark:text-zinc-50">
+        {conflict.role_label} <span className="font-normal text-zinc-400">— {candidateNames}</span>
+      </p>
+
+      {conflict.status === "choosing" &&
+        (!iAmCandidate ? (
+          <p className="mt-2 text-sm text-zinc-500">결정 중이에요...</p>
+        ) : myChoice?.choice ? (
+          <p className="mt-2 text-sm text-zinc-500">선택 완료! 상대를 기다리는 중...</p>
+        ) : (
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => onChoice(conflict.id, "priority")}
+              disabled={myPriorityUsed}
+              className="flex-1 rounded-xl border border-zinc-300 py-2 text-sm transition-colors hover:border-zinc-900 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700 dark:hover:border-zinc-50"
+            >
+              🔥 우선권
+            </button>
+            <button
+              type="button"
+              onClick={() => onChoice(conflict.id, "concede")}
+              className="flex-1 rounded-xl border border-zinc-300 py-2 text-sm transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:hover:border-zinc-50"
+            >
+              🤝 양보
+            </button>
+            <button
+              type="button"
+              onClick={() => onChoice(conflict.id, "duel")}
+              className="flex-1 rounded-xl border border-zinc-300 py-2 text-sm transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:hover:border-zinc-50"
+            >
+              🎲 승부
+            </button>
+          </div>
+        ))}
+
+      {conflict.status === "rps" && (
+        <RpsSection conflict={conflict} choices={choices} myMemberId={myMemberId} onRpsMove={onRpsMove} />
+      )}
+    </div>
+  );
+}
+
+function RpsSection({
+  conflict,
+  choices,
+  myMemberId,
+  onRpsMove,
+}: {
+  conflict: RoleConflict;
+  choices: RoleConflictChoice[];
+  myMemberId: string | null;
+  onRpsMove: (conflictId: string, move: RpsMove) => void;
+}) {
+  const finalistIds = conflict.finalist_ids ?? [];
+  const iAmFinalist = myMemberId != null && finalistIds.includes(myMemberId);
+  const myMove = choices.find((c) => c.conflict_id === conflict.id && c.member_id === myMemberId)?.rps_move;
+
+  return (
+    <div className="mt-2">
+      <p className="text-sm text-zinc-500">선택이 겹쳤어요 — 가위바위보로 정해요!</p>
+      {!iAmFinalist ? (
+        <p className="mt-2 text-sm text-zinc-500">대결 중이에요...</p>
+      ) : myMove ? (
+        <p className="mt-2 text-sm text-zinc-500">냈어요! 상대를 기다리는 중...</p>
+      ) : (
+        <div className="mt-2 flex gap-2">
+          <button
+            type="button"
+            onClick={() => onRpsMove(conflict.id, "rock")}
+            className="flex-1 rounded-xl border border-zinc-300 py-2 text-xl transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:hover:border-zinc-50"
+          >
+            ✊
+          </button>
+          <button
+            type="button"
+            onClick={() => onRpsMove(conflict.id, "scissors")}
+            className="flex-1 rounded-xl border border-zinc-300 py-2 text-xl transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:hover:border-zinc-50"
+          >
+            ✌️
+          </button>
+          <button
+            type="button"
+            onClick={() => onRpsMove(conflict.id, "paper")}
+            className="flex-1 rounded-xl border border-zinc-300 py-2 text-xl transition-colors hover:border-zinc-900 dark:border-zinc-700 dark:hover:border-zinc-50"
+          >
+            ✋
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }

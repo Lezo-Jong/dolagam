@@ -1,7 +1,15 @@
 import { notFound } from "next/navigation";
 import { getSupabase } from "@/lib/supabase";
 import { findSituation } from "@/lib/situations";
-import type { Draw, Member, Room, RoleAssignment, RolePreference } from "@/lib/types";
+import type {
+  Draw,
+  Member,
+  Room,
+  RoleAssignment,
+  RoleConflict,
+  RoleConflictChoice,
+  RolePreference,
+} from "@/lib/types";
 import { RoomView } from "@/components/RoomView";
 import { RoleGameView } from "@/components/RoleGameView";
 
@@ -28,10 +36,13 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
   const situationInfo = findSituation(room.situation);
 
   if (situationInfo) {
-    const [{ data: preferences }, { data: assignments }] = await Promise.all([
-      supabase.from("role_preferences").select("*").eq("room_id", room.id),
-      supabase.from("role_assignments").select("*").eq("room_id", room.id),
-    ]);
+    const [{ data: preferences }, { data: assignments }, { data: conflicts }, { data: conflictChoices }] =
+      await Promise.all([
+        supabase.from("role_preferences").select("*").eq("room_id", room.id),
+        supabase.from("role_assignments").select("*").eq("room_id", room.id),
+        supabase.from("role_conflicts").select("*").eq("room_id", room.id),
+        supabase.from("role_conflict_choices").select("*").eq("room_id", room.id),
+      ]);
 
     return (
       <RoleGameView
@@ -39,6 +50,8 @@ export default async function RoomPage({ params }: PageProps<"/r/[slug]">) {
         initialMembers={(members ?? []) as Member[]}
         initialPreferences={(preferences ?? []) as RolePreference[]}
         initialAssignments={(assignments ?? []) as RoleAssignment[]}
+        initialConflicts={(conflicts ?? []) as RoleConflict[]}
+        initialConflictChoices={(conflictChoices ?? []) as RoleConflictChoice[]}
         roles={situationInfo.situation.roles}
         situationLabel={`${situationInfo.category.label} · ${situationInfo.situation.label}`}
       />

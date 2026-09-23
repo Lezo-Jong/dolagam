@@ -85,7 +85,7 @@ export async function startGame(roomId: string) {
 
   const { error } = await supabase
     .from("rooms")
-    .update({ game_phase: "preference" })
+    .update({ game_phase: "preference", conflict_rank: 0 })
     .eq("id", roomId)
     .eq("game_phase", "lobby");
   if (error) return { ok: false as const, error: "시작하지 못했어요" };
@@ -156,115 +156,402 @@ function shuffle<T>(items: T[]): T[] {
   return arr;
 }
 
-// 지망 순서대로(1지망 -> 2지망 -> 3지망) 라운드를 돌면서 배정한다. 각 라운드에서
-// 같은 역할에 여러 명이 몰리면(충돌) 그 사람들 사이에서만 가중치 뽑기로 승자를 정하고,
-// 진 사람은 다음 라운드에서 자기 다음 지망으로 다시 시도할 기회를 갖는다 — "1지망이
-// 겹치면 바로 랜덤" 대신 지망을 다 써볼 수 있게 하는 부분이 이 함수의 핵심이다.
-// 지망을 하나도 못 받은 사람/아무도 원하지 않은 역할은 마지막에 무작위로 짝지어진다
+// 지망 순서대로(1지망 -> 2지망 -> 3지망) 라운드를 돌면서 배정한다. 각 지망 단계에서
+// 역할 하나에 후보가 1명뿐이면 바로 배정하고, 2명 이상 몰리면(충돌) 즉시 뽑지 않고
+// role_conflicts 행을 만들어 "우선권/양보/승부" 선택을 기다린다 — 뽑기는 게임 전체가
+// 아니라 그 선택이 끝난 뒤(둘 다 우선권을 쓰거나 승부를 택했을 때의 가위바위보, 혹은
+// 3명 이상 동률일 때)에만 등장하는 충돌 해결 수단 중 하나가 된다.
+// 충돌에서 진 사람은 다음 지망 단계에서 자기 다음 지망으로 다시 시도한다. 지망을 다
+// 써도 못 받았거나 아무도 원하지 않은 역할은 마지막에 무작위로 짝지어진다
 // (resolved_by='draw', assigned_rank=null = "비선호 역할 배정").
-//
-// 지금은 충돌을 뽑기로만 푸는데, resolved_by 필드를 남겨둔 건 나중에 우선권/카드/협상
-// 같은 다른 해결 방식을 추가할 자리를 만들어두기 위해서다.
-export async function resolveRoles(roomId: string) {
-  const supabase = getSupabase();
+// 서로 다른 두 충돌이 거의 동시에 끝나면 두 요청이 동시에 "다음 지망으로 넘어가자"고
+// 판단해서 같은 배정을 두 번 만들어버릴 수 있다(실제로 테스트 중 발견됨). rooms.advancing을
+// 락으로 써서 한 번에 한 요청만 진행하게 막는다 — 클레임에 실패한 쪽은 이미 다른 요청이
+// 같은 작업을 마쳤다는 뜻이라 조용히 넘어가면 된다.
+async function claimAdvance(supabase: ReturnType<typeof getSupabase>, roomId: string): Promise<boolean> {
+  const { data } = await supabase
+    .from("rooms")
+    .update({ advancing: true })
+    .eq("id", roomId)
+    .eq("advancing", false)
+    .select("id");
+  return (data?.length ?? 0) > 0;
+}
 
-  const { data: room } = await supabase.from("rooms").select("*").eq("id", roomId).maybeSingle();
-  if (!room) return { ok: false as const, error: "방을 찾을 수 없어요" };
-  if (room.game_phase !== "preference") {
-    return { ok: false as const, error: "지금은 결과를 확정할 수 없어요" };
+async function processNextRank(supabase: ReturnType<typeof getSupabase>, roomId: string): Promise<void> {
+  const claimed = await claimAdvance(supabase, roomId);
+  if (!claimed) return; // 다른 요청이 이미 다음 단계로 넘어가는 중
+  try {
+    await processNextRankInner(supabase, roomId);
+  } finally {
+    await supabase.from("rooms").update({ advancing: false }).eq("id", roomId);
   }
+}
+
+async function processNextRankInner(
+  supabase: ReturnType<typeof getSupabase>,
+  roomId: string
+): Promise<void> {
+  const { data: room } = await supabase.from("rooms").select("*").eq("id", roomId).maybeSingle();
+  if (!room || (room.game_phase !== "preference" && room.game_phase !== "conflict")) return;
 
   const situationInfo = findSituation(room.situation);
   const roleList = situationInfo?.situation.roles;
-  if (!roleList) return { ok: false as const, error: "역할 정보를 찾을 수 없어요" };
+  if (!roleList) return;
 
   const { data: members } = await supabase.from("members").select("*").eq("room_id", roomId);
-  if (!members || members.length < 2) {
-    return { ok: false as const, error: "참가자가 2명 이상 필요해요" };
-  }
+  if (!members) return;
 
-  const { data: prefs } = await supabase.from("role_preferences").select("*").eq("room_id", roomId);
+  const workingRound = room.round + 1;
+  const { data: existing } = await supabase
+    .from("role_assignments")
+    .select("*")
+    .eq("room_id", roomId)
+    .eq("round", workingRound);
 
-  // member_id -> rank -> role_label
-  const prefsByMember = new Map<string, Map<number, string>>();
-  for (const p of prefs ?? []) {
-    if (!prefsByMember.has(p.member_id)) prefsByMember.set(p.member_id, new Map());
-    prefsByMember.get(p.member_id)!.set(p.rank, p.role_label);
-  }
-
-  const round = room.round + 1;
-  const results = new Map<
-    string,
-    { role: string; assignedRank: number | null; resolvedBy: "preference" | "draw" }
-  >();
-  let unassigned = members;
-  const remainingRoles = new Set(roleList);
+  const assignedMemberIds = new Set((existing ?? []).map((a) => a.member_id));
+  const claimedRoles = new Set((existing ?? []).map((a) => a.role_label));
+  const unassigned = members.filter((m) => !assignedMemberIds.has(m.id));
+  const remainingRoles = roleList.filter((r) => !claimedRoles.has(r));
 
   const maxRank = Math.min(3, roleList.length);
-  for (let rank = 1; rank <= maxRank; rank++) {
-    if (unassigned.length === 0 || remainingRoles.size === 0) break;
+  const nextRank = room.conflict_rank + 1;
 
-    const byRole = new Map<string, Member[]>();
-    for (const member of unassigned) {
-      const role = prefsByMember.get(member.id)?.get(rank);
-      if (role && remainingRoles.has(role)) {
-        if (!byRole.has(role)) byRole.set(role, []);
-        byRole.get(role)!.push(member);
-      }
+  if (unassigned.length === 0 || remainingRoles.length === 0 || nextRank > maxRank) {
+    // 지망을 다 써도 못 받았거나 아무도 원하지 않은 역할 <-> 사람을 무작위로 짝짓고 마무리한다.
+    const leftoverMembers = shuffle(unassigned);
+    const rows = remainingRoles.flatMap((role) => {
+      const person = leftoverMembers.shift();
+      if (!person) return [];
+      return [
+        {
+          room_id: roomId,
+          role_label: role,
+          member_id: person.id,
+          member_name: person.name,
+          assigned_rank: null,
+          resolved_by: "draw" as const,
+          round: workingRound,
+        },
+      ];
+    });
+    if (rows.length > 0) await supabase.from("role_assignments").insert(rows);
+
+    const drawnIds = rows.map((r) => r.member_id);
+    if (drawnIds.length > 0) {
+      await supabase.from("members").update({ last_picked_round: workingRound }).in("id", drawnIds);
     }
 
-    for (const [role, candidates] of byRole) {
-      const winner = candidates.length === 1 ? candidates[0] : weightedPick(candidates, round);
-      results.set(winner.id, {
-        role,
-        assignedRank: rank,
-        resolvedBy: candidates.length > 1 ? "draw" : "preference",
+    await supabase
+      .from("rooms")
+      .update({ round: workingRound, game_phase: "result", conflict_rank: 0 })
+      .eq("id", roomId);
+    return;
+  }
+
+  const { data: prefs } = await supabase
+    .from("role_preferences")
+    .select("*")
+    .eq("room_id", roomId)
+    .eq("rank", nextRank);
+
+  const byRole = new Map<string, Member[]>();
+  for (const p of prefs ?? []) {
+    if (!remainingRoles.includes(p.role_label)) continue;
+    const member = unassigned.find((m) => m.id === p.member_id);
+    if (!member) continue;
+    if (!byRole.has(p.role_label)) byRole.set(p.role_label, []);
+    byRole.get(p.role_label)!.push(member);
+  }
+
+  const singleRows: {
+    room_id: string;
+    role_label: string;
+    member_id: string;
+    member_name: string;
+    assigned_rank: number;
+    resolved_by: "preference";
+    round: number;
+  }[] = [];
+  const conflictsToCreate: {
+    room_id: string;
+    round: number;
+    rank: number;
+    role_label: string;
+    candidate_ids: string[];
+    status: "choosing";
+  }[] = [];
+
+  for (const [role, candidates] of byRole) {
+    if (candidates.length === 1) {
+      singleRows.push({
+        room_id: roomId,
+        role_label: role,
+        member_id: candidates[0].id,
+        member_name: candidates[0].name,
+        assigned_rank: nextRank,
+        resolved_by: "preference",
+        round: workingRound,
       });
-      remainingRoles.delete(role);
+    } else {
+      conflictsToCreate.push({
+        room_id: roomId,
+        round: workingRound,
+        rank: nextRank,
+        role_label: role,
+        candidate_ids: candidates.map((c) => c.id),
+        status: "choosing",
+      });
     }
-    unassigned = unassigned.filter((m) => !results.has(m.id));
   }
 
-  // 지망을 다 써도 못 받았거나 애초에 아무것도 고르지 않은 사람 <-> 아무도 원하지 않은
-  // 역할을 마지막으로 무작위 매칭한다.
-  const leftoverMembers = shuffle(unassigned);
-  for (const role of remainingRoles) {
-    const person = leftoverMembers.shift();
-    if (!person) break;
-    results.set(person.id, { role, assignedRank: null, resolvedBy: "draw" });
+  if (singleRows.length > 0) await supabase.from("role_assignments").insert(singleRows);
+  await supabase.from("rooms").update({ conflict_rank: nextRank }).eq("id", roomId);
+
+  if (conflictsToCreate.length > 0) {
+    await supabase.from("role_conflicts").insert(conflictsToCreate);
+    await supabase.from("rooms").update({ game_phase: "conflict" }).eq("id", roomId);
+    return;
   }
 
-  const rows = [...results.entries()].map(([memberId, { role, assignedRank, resolvedBy }]) => {
-    const member = members.find((m) => m.id === memberId)!;
-    return {
-      room_id: roomId,
-      role_label: role,
-      member_id: member.id,
-      member_name: member.name,
-      assigned_rank: assignedRank,
-      resolved_by: resolvedBy,
-      round,
-    };
+  // 이번 지망 단계엔 충돌이 하나도 없었으면(전부 단독 지원이거나 아무도 안 골랐으면)
+  // 사람을 기다릴 필요 없이 바로 다음 지망으로 넘어간다(락은 이미 쥐고 있으니 Inner를
+  // 직접 부른다 — processNextRank를 다시 부르면 스스로 락에 걸려 멈춰버린다).
+  return processNextRankInner(supabase, roomId);
+}
+
+async function finalizeConflict(
+  supabase: ReturnType<typeof getSupabase>,
+  conflict: { id: string; room_id: string; role_label: string; rank: number; round: number },
+  winnerId: string,
+  reason: "priority" | "duel" | "draw"
+): Promise<void> {
+  const { data: winner } = await supabase.from("members").select("*").eq("id", winnerId).maybeSingle();
+  if (!winner) return;
+
+  await supabase.from("role_assignments").insert({
+    room_id: conflict.room_id,
+    role_label: conflict.role_label,
+    member_id: winner.id,
+    member_name: winner.name,
+    assigned_rank: conflict.rank,
+    resolved_by: reason,
+    round: conflict.round,
   });
 
-  const { error: insertError } = await supabase.from("role_assignments").insert(rows);
-  if (insertError) return { ok: false as const, error: "결과를 저장하지 못했어요" };
+  await supabase
+    .from("role_conflicts")
+    .update({ status: "resolved", winner_id: winner.id, winner_reason: reason })
+    .eq("id", conflict.id);
 
-  await supabase.from("rooms").update({ round, game_phase: "result" }).eq("id", roomId);
+  // 충돌을 뚫고 역할을 가져간 사람은 "이번에 유리했다"는 뜻이므로 기존 공정성 가중치
+  // (last_picked_round)에도 반영한다 — 자기 지망을 그대로 받은 사람(무충돌)과 구분된다.
+  await supabase.from("members").update({ last_picked_round: conflict.round }).eq("id", winner.id);
 
-  // 뽑기로 결정된 사람만 "이번 라운드에 뽑혔다"고 기록한다 — 자기가 고른 역할을 그대로
-  // 받은 사람은 공정성 가중치에 영향을 주지 않는다(기존 draw_winner와 같은 의미).
-  const drawnMemberIds = rows.filter((r) => r.resolved_by === "draw").map((r) => r.member_id);
-  if (drawnMemberIds.length > 0) {
-    await supabase.from("members").update({ last_picked_round: round }).in("id", drawnMemberIds);
+  await checkRoundProgress(supabase, conflict.room_id);
+}
+
+async function checkRoundProgress(supabase: ReturnType<typeof getSupabase>, roomId: string) {
+  const { data: room } = await supabase.from("rooms").select("*").eq("id", roomId).maybeSingle();
+  if (!room || room.game_phase !== "conflict") return;
+
+  const workingRound = room.round + 1;
+  const { count } = await supabase
+    .from("role_conflicts")
+    .select("*", { count: "exact", head: true })
+    .eq("room_id", roomId)
+    .eq("round", workingRound)
+    .neq("status", "resolved");
+  if ((count ?? 0) > 0) return; // 다른 역할의 충돌이 아직 안 끝났으면 기다린다.
+
+  await processNextRank(supabase, roomId);
+}
+
+// 판정을 실제로 내려도 되는지 원자적으로 선점한다. 두 사람이 선택/가위바위보를 거의
+// 동시에 제출하면 두 요청 모두 "이제 판정할 수 있다"고 볼 수 있는데, 그중 status를
+// 실제로 바꾸는 데 성공한 요청만 판정을 진행하게 해서 같은 충돌이 두 번 끝나는(=같은
+// 역할이 두 번 배정되는) 일을 막는다.
+async function claimConflict(
+  supabase: ReturnType<typeof getSupabase>,
+  conflictId: string,
+  fromStatus: string,
+  toStatus: string
+): Promise<boolean> {
+  const { data } = await supabase
+    .from("role_conflicts")
+    .update({ status: toStatus })
+    .eq("id", conflictId)
+    .eq("status", fromStatus)
+    .select("id");
+  return (data?.length ?? 0) > 0;
+}
+
+// 충돌 하나(role_conflicts 한 행)에 걸린 선택이 다 모였는지 보고, 다 모였으면 규칙대로
+// 판정한다 — 이 판정 규칙표가 이 기능의 핵심이다.
+//   양보만 있으면(전원 양보): 아무도 못 받음 -> 다음 지망으로 이월
+//   경쟁자가 1명만 남으면: 그 사람이 바로 승리
+//   우선권 사용자가 있으면: 우선권 사용자끼리만(1명이면 바로 승리, 2명이면 가위바위보)
+//   전원 승부(우선권 없이): 다 같이 가위바위보(2명 초과면 예외적으로 가중치 뽑기)
+async function tryResolveConflict(supabase: ReturnType<typeof getSupabase>, conflictId: string) {
+  const { data: conflict } = await supabase
+    .from("role_conflicts")
+    .select("*")
+    .eq("id", conflictId)
+    .maybeSingle();
+  if (!conflict || conflict.status === "resolved") return;
+
+  const { data: choices } = await supabase
+    .from("role_conflict_choices")
+    .select("*")
+    .eq("conflict_id", conflictId);
+  const choiceByMember = new Map((choices ?? []).map((c) => [c.member_id as string, c]));
+
+  if (conflict.status === "choosing") {
+    const candidateIds: string[] = conflict.candidate_ids;
+    const allChose = candidateIds.every((id) => choiceByMember.get(id)?.choice);
+    if (!allChose) return;
+
+    const contenders = candidateIds.filter((id) => choiceByMember.get(id)?.choice !== "concede");
+
+    if (contenders.length === 0) {
+      // 전원 양보 — 이 역할은 이번 지망 단계에서 아무도 못 받는다(다음 지망에서
+      // 각자의 다음 선호가 다시 조회되므로 별도 이월 처리가 필요 없다).
+      if (!(await claimConflict(supabase, conflictId, "choosing", "resolved"))) return;
+      await checkRoundProgress(supabase, conflict.room_id);
+      return;
+    }
+
+    if (contenders.length === 1) {
+      const winnerChoice = choiceByMember.get(contenders[0])?.choice;
+      if (!(await claimConflict(supabase, conflictId, "choosing", "resolved"))) return;
+      await finalizeConflict(supabase, conflict, contenders[0], winnerChoice === "priority" ? "priority" : "duel");
+      return;
+    }
+
+    const priorityUsers = contenders.filter((id) => choiceByMember.get(id)?.choice === "priority");
+    const finalists = priorityUsers.length > 0 ? priorityUsers : contenders;
+
+    if (finalists.length === 1) {
+      if (!(await claimConflict(supabase, conflictId, "choosing", "resolved"))) return;
+      await finalizeConflict(supabase, conflict, finalists[0], priorityUsers.length > 0 ? "priority" : "duel");
+      return;
+    }
+
+    if (finalists.length === 2) {
+      // 여기는 두 번 실행돼도 같은 finalist_ids로 같은 값을 덮어쓸 뿐이라 굳이 선점하지
+      // 않는다(role_assignments에 새 행이 생기는 게 아니라서 중복 문제가 없다).
+      await supabase
+        .from("role_conflicts")
+        .update({ status: "rps", finalist_ids: finalists })
+        .eq("id", conflictId);
+      return;
+    }
+
+    // 3명 이상 동률(예: 다 같이 우선권 사용)은 가위바위보 다인전까지는 만들지 않고
+    // 기존 공정성 뽑기로 바로 정리한다.
+    if (!(await claimConflict(supabase, conflictId, "choosing", "resolved"))) return;
+    const { data: members } = await supabase.from("members").select("*").in("id", finalists);
+    const winner = weightedPick((members ?? []) as Member[], conflict.round);
+    await finalizeConflict(supabase, conflict, winner.id, "draw");
+    return;
   }
 
+  if (conflict.status === "rps") {
+    const finalistIds: string[] = conflict.finalist_ids ?? [];
+    const moves = finalistIds.map((id) => choiceByMember.get(id)?.rps_move);
+    if (moves.some((m) => !m)) return;
+
+    const [aId, bId] = finalistIds;
+    const aMove = choiceByMember.get(aId)?.rps_move;
+    const bMove = choiceByMember.get(bId)?.rps_move;
+
+    if (aMove === bMove) {
+      // 비겼으면 다시 낸다(두 번 실행돼도 null로 다시 지우는 것뿐이라 안전하다).
+      await supabase
+        .from("role_conflict_choices")
+        .update({ rps_move: null })
+        .eq("conflict_id", conflictId)
+        .in("member_id", finalistIds);
+      return;
+    }
+
+    if (!(await claimConflict(supabase, conflictId, "rps", "resolved"))) return;
+    const beats: Record<string, string> = { rock: "scissors", scissors: "paper", paper: "rock" };
+    const winnerId = beats[aMove!] === bMove ? aId : bId;
+    const winnerChoice = choiceByMember.get(winnerId)?.choice;
+    await finalizeConflict(supabase, conflict, winnerId, winnerChoice === "priority" ? "priority" : "duel");
+  }
+}
+
+export async function resolveRoles(roomId: string) {
+  const supabase = getSupabase();
+  const { data: room } = await supabase.from("rooms").select("*").eq("id", roomId).maybeSingle();
+  if (!room) return { ok: false as const, error: "방을 찾을 수 없어요" };
+  if (room.game_phase !== "preference") {
+    return { ok: false as const, error: "지금은 확인할 수 없어요" };
+  }
+
+  const { count } = await supabase
+    .from("members")
+    .select("*", { count: "exact", head: true })
+    .eq("room_id", roomId);
+  if ((count ?? 0) < 2) return { ok: false as const, error: "참가자가 2명 이상 필요해요" };
+
+  await processNextRank(supabase, roomId);
+  return { ok: true as const };
+}
+
+// choice: 'priority'(우선권 사용) | 'concede'(양보) | 'duel'(승부).
+export async function submitConflictChoice(
+  roomId: string,
+  conflictId: string,
+  memberId: string,
+  choice: "priority" | "concede" | "duel"
+) {
+  const supabase = getSupabase();
+
+  if (choice === "priority") {
+    const { data: member } = await supabase
+      .from("members")
+      .select("priority_token_used")
+      .eq("id", memberId)
+      .maybeSingle();
+    if (member?.priority_token_used) {
+      return { ok: false as const, error: "우선권을 이미 사용했어요" };
+    }
+    await supabase.from("members").update({ priority_token_used: true }).eq("id", memberId);
+  }
+
+  const { error } = await supabase
+    .from("role_conflict_choices")
+    .upsert(
+      { room_id: roomId, conflict_id: conflictId, member_id: memberId, choice },
+      { onConflict: "conflict_id,member_id" }
+    );
+  if (error) return { ok: false as const, error: "선택을 저장하지 못했어요" };
+
+  await tryResolveConflict(supabase, conflictId);
+  return { ok: true as const };
+}
+
+export async function submitRpsMove(conflictId: string, memberId: string, move: "rock" | "paper" | "scissors") {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from("role_conflict_choices")
+    .update({ rps_move: move })
+    .eq("conflict_id", conflictId)
+    .eq("member_id", memberId);
+  if (error) return { ok: false as const, error: "선택을 저장하지 못했어요" };
+
+  await tryResolveConflict(supabase, conflictId);
   return { ok: true as const };
 }
 
 export async function restartRound(roomId: string) {
   const supabase = getSupabase();
+  await supabase.from("role_conflicts").delete().eq("room_id", roomId);
   await supabase.from("role_assignments").delete().eq("room_id", roomId);
   await supabase.from("role_preferences").delete().eq("room_id", roomId);
-  await supabase.from("rooms").update({ game_phase: "preference" }).eq("id", roomId);
+  await supabase.from("members").update({ priority_token_used: false }).eq("room_id", roomId);
+  await supabase.from("rooms").update({ game_phase: "preference", conflict_rank: 0 }).eq("id", roomId);
 }
